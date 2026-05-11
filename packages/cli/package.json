@@ -1,0 +1,42 @@
+{
+  "name": "mavis-pet",
+  "version": "0.1.0",
+  "description": "Mavis Pet — desktop companion that reacts to your mavis sessions. Install/control/run from the terminal.",
+  "type": "module",
+  "bin": {
+    "mavis-pet": "./bin/mavis-pet.mjs"
+  },
+  "files": [
+    "bin",
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc && chmod +x dist/cli.js",
+    "start": "node dist/cli.js",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@mavis-pet/broker": "^0.1.0",
+    "kleur": "^4.1.5"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.5.0",
+    "vitest": "^2.1.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "keywords": ["mavis", "petdex", "desktop-pet", "agent-companion", "cli"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vinozhong33/mavis-pet.git",
+    "directory": "packages/cli"
+  },
+  "homepage": "https://github.com/vinozhong33/mavis-pet#readme",
+  "publishConfig": {
+    "access": "public"
+  }
+}

@@ -1,0 +1,30 @@
+# Build artifacts
+**/node_modules/
+**/dist/
+**/target/
+**/gen/
+**/*.tsbuildinfo
+
+# Tauri / Cargo
+packages/floater/Cargo.lock
+packages/floater/target/
+packages/floater/gen/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Local logs
+*.log
+/tmp/
+
+# Test artifacts
+**/coverage/
+
+# Release artifacts (handled separately, not in git)
+release/
+*.dmg
+*.app.zip

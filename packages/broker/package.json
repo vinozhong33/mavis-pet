@@ -1,0 +1,50 @@
+{
+  "name": "@mavis-pet/broker",
+  "version": "0.1.0",
+  "description": "Mavis Pet broker — receives mavis hook events over HTTP, maintains per-session state machine, pushes aggregated pet animation state to floater clients via WebSocket.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "mavis-pet-broker": "bin/mavis-pet-broker.mjs"
+  },
+  "files": [
+    "dist",
+    "bin",
+    "PROTOCOL.md",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsx src/main.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "start": "node bin/mavis-pet-broker.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/ws": "^8.5.13",
+    "tsup": "^8.3.5",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "keywords": ["mavis", "petdex", "desktop-pet", "agent-companion"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vinozhong33/mavis-pet.git",
+    "directory": "packages/broker"
+  },
+  "homepage": "https://github.com/vinozhong33/mavis-pet#readme",
+  "publishConfig": {
+    "access": "public"
+  }
+}
