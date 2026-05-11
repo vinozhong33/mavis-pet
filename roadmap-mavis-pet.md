@@ -10,9 +10,9 @@
 
 | ID | 标题 | 状态 | 触发条件 |
 |----|------|------|----------|
-| R1 | jump 动画(用户互动喜悦) | 暂缓 | mavis 加 UserMessage hook 后 |
+| R1 | jump 动画(用户互动喜悦) | ✅ v0.2 已做 | UserPromptSubmit hook → jump 1.5s |
 | R2 | review 动画(等用户决策) | 暂缓 | 用 team plan 频率上来后 |
-| R3 | extra1/2 动画(cron 触发等) | 暂缓 | v0 跑稳后 |
+| R3 | extra1/2 动画(SessionStart/End) | ✅ v0.2 已做 | SessionStart/End hook → extra1/extra2 2.5s |
 | R4 | 把 broker 协议 PR 回上游 petdex | 暂缓 | v0 验证可行后 |
 | R5 | Linux 支持 | 暂缓 | 用户切 Linux 时 |
 | R6 | Windows 支持 | 暂缓 | 用户切 Windows 时 |
@@ -20,23 +20,23 @@
 | R8 | 多宠物切换 UI(右键菜单) | 暂缓 | 装了 ≥3 只宠物时 |
 | R9 | Fork petdex-desktop 替换 Tauri | 不做 | 仅作为 R4 副产品考虑 |
 | R10 | 自己造 mavis 专属宠物素材 | 暂缓 | 想 brand 化时 |
+| R11 | speech bubble UI(气泡文案) | ✅ v0.2 已做 | codex 风 pill + brand 徽标 |
 
 ---
 
 ## 详细条目
 
-### R1. jump 动画 — 用户互动喜悦
+### R1. jump 动画 — 用户互动喜悦  ✅ v0.2 已做
 
-**需求**:用户发新消息给 mavis 时,宠物跳一下/兴奋反应,体现"主人来了"。
+**已实装** — 2026-05-12 v0.2 完成。
 
-**为啥 v0 不做**:mavis 当前的 hook 系统没有 `UserMessage` 事件(只有 `PreToolUse/PostToolUse/MessageComplete`)。要做这个得先给 mavis 加 hook event。
+mavis daemon 实际**已有** `UserPromptSubmit` hook event(v0.1 时漏调研),不需要给 mavis 加新事件。
 
-**做的方式**:
-1. mavis 本体加 `UserMessage` hook event(daemon 层在用户消息进入 session 时 emit)
-2. broker 监听这个事件,推 `state: jump` 给 floater,1 秒后回上一个状态
-3. 配置项 `userMessageAnimation: "jump" | "wave" | "none"`(可关)
-
-**估算**:mavis 改 1-2 文件 + broker 加 case + 配置入口 ≈ 半天
+实现:
+- 安装的第 4 条 hook(`mavis-pet hook install`)在 UserPromptSubmit 时 POST 给 broker
+- broker 状态机 → `jump` overlay,priority 6 > run/wave
+- 1.5s 后自动降级
+- 默认气泡 "hey!"
 
 ---
 
@@ -56,18 +56,19 @@
 
 ---
 
-### R3. extra1/2 动画 — cron / 自定义事件
+### R3. extra1/2 动画 — SessionStart / SessionEnd  ✅ v0.2 已做
 
-**需求**:cron 任务触发、agent 之间互发消息、健康事件同步等"非主线但有意义"的时刻,宠物做点小反应。
+**已实装** — 2026-05-12 v0.2 完成。
 
-**为啥 v0 不做**:v0 先把主线 4 状态稳定再说;extra 是锦上添花。
+绑定到 mavis 已有的 SessionStart / SessionEnd hook,而不是 cron。
 
-**做的方式**:
-- broker 配置文件加 `customEvents` map:`{eventPattern: animationState}`
-- 用户自己挂 hook `script: curl localhost:<broker-port>/event -d '{state: extra1}'`
-- 或 broker 直接订阅 cron 触发事件(需要 mavis daemon expose)
+实现:
+- `mavis-pet hook install` 装的第 5、6 条 hook
+- SessionStart → `extra1` overlay 2.5s,默认气泡 "morning"
+- SessionEnd → `extra2` overlay 2.5s,然后 session 被 broker 自动 forget
+- 优先级 5 / 4(在 wave 之上,在 jump 之下)
 
-**估算**:配置入口 + 文档 ≈ 半天
+如果要做 cron 触发那种"自定义事件"动画,后续走"用户挂自己的 hook 直接 POST `/event`"的扩展性方案。
 
 ---
 
@@ -153,17 +154,37 @@
 
 ---
 
+### R11. speech bubble UI  ✅ v0.2 已做
+
+**已实装** — 2026-05-12 v0.2 完成。
+
+需求:状态切换时,在宠物旁边飘一个简短气泡(像 codex/petdex 的 "Thinking..." 那种)增加交互温度。
+
+实现:
+- broker `WsStateMessage` 加 `bubble?: string` + `bubbleTtlMs?: number` 字段
+- 默认气泡映射:morning / hey! / done! / oops / your turn / bye
+- floater 端 codex 风格 pill 气泡:
+  - 超圆角 `border-radius: 999px`
+  - 左侧紫色渐变圆形 brand 徽标(白色 "M" 字)
+  - 双层柔和阴影
+  - pet 在窗口右下,bubble 在左上,无尾巴
+  - fade in/out 200ms
+- 用户可通过 `bubbles` 配置项覆盖文案,通过 `bubbleTtlMs` 调时长
+
+---
+
 ## 优先级建议(下次 v1 做哪个)
 
 按"用户感知 / 实现难度"排序:
 
-1. **R1 jump**(用户最常感受到 — 每次发消息都触发,且改动小)
+1. **R2 review**(team plan 用得多了之后必要;需要 broker polling daemon awaiting_decision)
 2. **R8 多宠物切换 UI**(用户装第 3 只宠物时立刻想要)
-3. **R2 review**(team plan 用得多了之后必要)
-4. **R7 桌面通知**(等到飞书通道满意度下降时)
-5. **R3 extra1/2**(等用户提出具体场景再做)
-6. **R4 PR 上游**(战略性,不紧急)
-7. **R5/R6 跨平台**(等用户切平台)
+3. **R7 桌面通知**(等到飞书通道满意度下降时)
+4. **R4 PR 上游**(战略性,不紧急)
+5. **R5/R6 跨平台**(等用户切平台)
+6. **R10 自家素材**(brand 化时)
+
+R1 / R3 / R11 已在 v0.2 完成,不再排队。
 
 ---
 

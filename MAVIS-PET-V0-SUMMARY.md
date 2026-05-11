@@ -1,90 +1,100 @@
-# mavis-pet v0 — 总结
+# mavis-pet — 总结(v0.2)
 
 ## 这是什么
 
-屏幕上的动画宠物 floater,根据 mavis 的 lifecycle 事件实时反应:
-- mavis 调用工具 → 宠物 `run`
-- mavis 工具失败 → 宠物 `failed`(2s 后回 run/idle)
-- mavis 输出完一段回复 → 宠物 `wave`(1s 后回 idle)
-- 全局空闲 30s → 宠物 `idle`
+屏幕上的动画宠物 floater,根据 mavis 的 lifecycle 事件实时反应,并在状态切换时飘出小气泡(codex/petdex 风格 pill bubble)。
 
-复用 [petdex](https://github.com/crafter-station/petdex) 的开放 spritesheet 格式,可以装它社区的所有宠物。
+## 状态映射(v0.2 — 8 状态,7 个已实装)
+
+优先级:`failed > review > jump > extra1 > extra2 > wave > run > idle`
+
+| 状态 | 触发 | TTL | 默认气泡 |
+|------|------|-----|---------|
+| `extra1` | SessionStart | 2.5s | morning |
+| `extra2` | SessionEnd(然后 session 被 forget) | 2.5s | bye |
+| `jump` | UserPromptSubmit(你发消息) | 1.5s | hey! |
+| `failed` | PostToolUse exitCode≠0 / toolResult 含 error | 2s | oops |
+| `wave` | MessageComplete(我答完一段) | 1s | done! |
+| `run` | PreToolUse / PostToolUse 成功(base) | 持续 | — |
+| `idle` | 30s 静默或无活动 session | 持续 | — |
+| `review` | (留 v0.4 — 等用户决策时) | — | your turn |
 
 ## 项目位置
 
-`~/mavis-pet/` (你可以 `git init` 之后 push 到任何 git 远端)
+`~/mavis-pet/` — 已 push 到 [github.com/vinozhong33/mavis-pet](https://github.com/vinozhong33/mavis-pet)
 
 ```
 mavis-pet/
 ├── packages/
-│   ├── broker/      Node + TS,事件中枢 + 状态机 + WS server
-│   ├── floater/     Tauri (Rust),桌面透明窗口 + sprite 动画
+│   ├── broker/      Node + TS,事件中枢 + 状态机 + WS server (38/38 测试)
+│   ├── floater/     Tauri (Rust),透明窗口 + sprite 动画 + codex 风气泡
 │   └── cli/         npm 包,顶层 mavis-pet 命令
-├── plan-mavis-pet.md       初始设计文档
-└── roadmap-mavis-pet.md    v0 不做的功能清单(R1-R10)
+├── plan-mavis-pet.md       初始设计
+└── roadmap-mavis-pet.md    后续 roadmap(v0.4 待办)
 ```
 
 ## 怎么用
 
-**首次安装(已经做完了,你现在直接用):**
+**已装好,直接用:**
 ```bash
-cd ~/mavis-pet/packages/cli
-node bin/mavis-pet.mjs install boba    # 已装
-node bin/mavis-pet.mjs hook install     # 已装
-node bin/mavis-pet.mjs start            # 已起
+mavis-pet status      # 看状态
+mavis-pet switch <slug>  # 切宠物(先 install)
+mavis-pet stop        # 关
 ```
 
-**现在就有效**:你看到的屏幕上的宠物,会随我和你后面任何对话/工具调用动起来。
-
-**日常控制:**
+**新机器装:**
 ```bash
-node bin/mavis-pet.mjs status      # 看状态
-node bin/mavis-pet.mjs switch <slug>  # 切宠物(先 install)
-node bin/mavis-pet.mjs stop        # 关
+git clone git@github.com:vinozhong33/mavis-pet.git
+cd mavis-pet
+# 装依赖 + build
+(cd packages/broker && npm i && npm run build && npm test)
+(cd packages/cli    && npm i && npm run build && npm link)
+(cd packages/floater && cargo build --release)
+# 装宠物 + 启动
+mavis-pet install boba
+mavis-pet hook install     # 装 6 条 mavis hook
+mavis-pet start            # broker + floater 都起
 ```
 
-**全局安装(随时随地敲 mavis-pet,不用 cd):**
-```bash
-cd ~/mavis-pet/packages/cli
-npm link
-# 之后任意位置 `mavis-pet status` 就能跑
-```
+## v0.2 已实现
 
-## v0 已实现
-
-- [x] Broker:Node + TS,33/33 测试全过,状态机用 Clock 抽象保证时间确定
-- [x] Floater:Tauri v2,透明 + frameless + always-on-top + 拖拽,3.2MB binary
+### v0.1 基础(2026-05 中)
+- [x] Broker:Node + TS,Clock 抽象保证时间确定
+- [x] Floater:Tauri v2 透明 frameless always-on-top + 拖拽
 - [x] CLI:install / list / switch / start / stop / status / hook install/uninstall
-- [x] Petdex 兼容:能装它所有宠物,sprite 格式(8×9 frame, 192×208 px) 自动识别
-- [x] 自动重连:broker 没起 floater 保持 idle,broker 上线自动连
-- [x] 切宠物热重载:`switch` 通知 broker→floater 重新加载
-- [x] mavis hook 集成:3 条 user hook 自动装到 mavis daemon
-- [x] 给 main agent 的 skill 文档,排错指引
+- [x] Petdex 兼容:能装它所有宠物
+- [x] 切宠物热重载
 
-## v0 不做(roadmap)
+### v0.2 新增(2026-05-12)
+- [x] 8 状态(从 4 扩到 8,review 留 v0.4)
+- [x] 3 个新 hook event:UserPromptSubmit / SessionStart / SessionEnd
+- [x] **气泡 UI** — codex/petdex 风格 pill bubble + 紫色 brand 徽标
+- [x] 6 条 mavis hook 自动装(原 3 条 + 新 3 条)
+- [x] window 加大 70×76 → 140×120 容纳气泡
+- [x] 38/38 测试全过(原 33 + v0.2 新 5 个)
+- [x] 修复 v0.1 .gitignore 漏 `packages/floater/dist/` 的问题
 
-详见 `~/mavis-pet/roadmap-mavis-pet.md` 的 R1-R10。简短:
-- jump / review / extra1-2 状态(需要 mavis 加新 hook event)
-- 桌面右键菜单切宠物
-- macOS 系统通知(你已有飞书通道)
-- Linux / Windows 支持
-- PR 回上游 petdex
-- 自家 mavis brand 宠物素材
+## v0.4+ 待办(roadmap)
 
-## 故障排查 5 条
+详见 `roadmap-mavis-pet.md`:
+
+- **review 状态**(R2)— broker polling daemon 看哪个 main session 等用户决策
+- **多宠物切换右键菜单**(R8)
+- **打包成 npm 包**:`npx mavis-pet install boba` 一行起飞
+- **Linux / Windows 跨平台**(R5/R6)
+- **PR broker 协议回上游 petdex**(R4)
+- **mavis brand 自有宠物素材**(R10)
+
+## 故障排查
 
 | 现象 | 处理 |
 |---|---|
-| 屏幕看不到宠物 | `mavis-pet status`,floater not running 就 `start`;running 但看不到可能在屏幕角外,`stop && start` |
-| 宠物在屏幕但不切动画 | curl 模拟事件验 broker:`curl -XPOST ... /event`;broker state 不变 → broker 状态机有问题(跑 broker 包 npm test);state 变了但不切 → wsClients 看是不是 0,floater 重启 |
-| mavis 干活宠物不反应 | `mavis hook list \| grep mavis-pet`,3 条都在?没有就 `hook install` |
-| broker 起不来 | 7857 端口可能被占,`MAVIS_PET_BROKER_PORT=7858 mavis-pet start` |
-| 某只宠物加载不出 | 看 `~/.mavis/pets/<slug>/` 有没有 `pet.json` + `spritesheet.{webp,png}`,缺了重 install |
+| 屏幕看不到宠物 | `mavis-pet status`;running 但看不到可能在屏幕角外,`stop && start` |
+| 宠物在屏幕但不切动画 | `curl -XPOST http://127.0.0.1:7857/event -d '{"sessionId":"t","kind":"PreToolUse"}'` 验 broker;不变 → broker 状态机问题(`cd packages/broker && npm test`);state 变了但不切 → wsClients=0,floater 重启 |
+| 我聊天时宠物不反应 | `mavis hook list \| grep mavis-pet` 应该 6 条;少了 `mavis-pet hook install` |
+| broker 起不来 | 7857 占用 → `MAVIS_PET_BROKER_PORT=7858 mavis-pet start` |
+| 气泡飘但太短 | 默认 TTL 2.5s,要改 broker 的 `bubbleTtlMs` 配置 |
 
-## 接下来的事(要不要做你说)
+## 接下来
 
-- **R1 jump 状态** — mavis 加 `UserMessage` hook 后,你发消息时宠物跳一下。要做我去给 mavis 提需求
-- **R8 右键菜单** — 装第 3 只宠物时再做最优
-- **打包成正式 npm 包** — 做完了可以 `npx mavis-pet install boba` 一行起飞,适合分享
-
-随时说"启动 R1"/"做右键菜单"/"打包发布",我从 roadmap 捞背景接着干。
+随时说"启动 R2 review"/"做右键菜单"/"打包发布 npm",我从 roadmap 捞背景接着干。
