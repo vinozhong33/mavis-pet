@@ -24,6 +24,44 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use tauri::{Emitter, Manager};
 
+// ---- macOS: lift floater above fullscreen Spaces & menu bar ---------------
+
+#[cfg(target_os = "macos")]
+fn elevate_for_fullscreen(window: &tauri::WebviewWindow) -> Result<(), String> {
+    use cocoa::appkit::{NSWindow, NSWindowCollectionBehavior};
+    use cocoa::base::id;
+    use objc::{msg_send, sel, sel_impl};
+
+    let ns_window = window
+        .ns_window()
+        .map_err(|e| format!("ns_window: {e}"))? as id;
+
+    unsafe {
+        // Combine flags so the window:
+        //   - rides on top of every Space, including other apps' fullscreen Spaces
+        //   - is treated as an auxiliary panel (not promoted as a real fullscreen target)
+        //   - stays put when Spaces are switched
+        //   - skips Cmd-Tab and window cycling
+        let behavior: NSWindowCollectionBehavior =
+            NSWindowCollectionBehavior::NSWindowCollectionBehaviorCanJoinAllSpaces
+                | NSWindowCollectionBehavior::NSWindowCollectionBehaviorFullScreenAuxiliary
+                | NSWindowCollectionBehavior::NSWindowCollectionBehaviorStationary
+                | NSWindowCollectionBehavior::NSWindowCollectionBehaviorIgnoresCycle;
+        ns_window.setCollectionBehavior_(behavior);
+
+        // NSPopUpMenuWindowLevel = 101 — above the menu bar (NSMainMenuWindowLevel = 24)
+        // and above other apps' fullscreen content.  NSScreenSaverWindowLevel (1000)
+        // would also work but is overkill and steals events from native screen savers.
+        let _: () = msg_send![ns_window, setLevel: 101_i64];
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn elevate_for_fullscreen(_window: &tauri::WebviewWindow) -> Result<(), String> {
+    Ok(())
+}
+
 // ---- Pet discovery ---------------------------------------------------------
 
 fn pets_dirs() -> Vec<PathBuf> {
@@ -221,9 +259,16 @@ fn reload_pet(app: tauri::AppHandle) -> Result<(), String> {
 pub fn run() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![get_pet, list_pets, reload_pet])
-        .setup(|_app| {
+        .setup(|app| {
             // Touch the path to surface "no home dir" failures early in stderr.
             let _ = config_path();
+            // Elevate window so it stays visible above other apps' fullscreen Spaces.
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.set_visible_on_all_workspaces(true);
+                if let Err(e) = elevate_for_fullscreen(&window) {
+                    eprintln!("[mavis-pet-floater] elevate_for_fullscreen failed: {e}");
+                }
+            }
             Ok(())
         })
         .run(tauri::generate_context!())

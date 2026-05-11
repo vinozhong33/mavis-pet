@@ -56,6 +56,63 @@ mavis-pet hook install     # 装 6 条 mavis hook
 mavis-pet start            # broker + floater 都起
 ```
 
+## 换宠物形象
+
+mavis-pet 用 [petdex](https://github.com/crafter-station/petdex) 的开放 spritesheet 格式,
+**petdex 上能装的所有宠物 mavis-pet 都能装**,装法和 codex/petdex-desktop 完全一样:
+manifest 来自 `https://petdex.crafter.run/api/manifest`,sprite 192×208 px、8 列 × 9 行 grid、
+6 帧动画/状态。
+
+### 看有哪些可选
+
+```bash
+# 浏览所有宠物(看 slug)
+open https://petdex.crafter.run
+
+# 看本机已装
+mavis-pet list
+# ★ active   boba                 ~/.mavis/pets
+#            cat                  ~/.codex/pets   ← 也能用 codex 那边装过的
+```
+
+> mavis-pet CLI 同时扫 `~/.mavis/pets/` 和 `~/.codex/pets/`,所以你之前在 codex 里装的
+> 宠物不用重装,直接 `mavis-pet switch <slug>` 就用上。
+
+### 装 + 切
+
+```bash
+# 装一只新的(从 petdex manifest 自动拉 sprite + meta.json)
+mavis-pet install otter
+
+# 立刻切过去(broker 通知 floater 热重载,无需重启)
+mavis-pet switch otter
+```
+
+### 自定义/手动放一只
+
+如果你有自己的 spritesheet(或者从别的地方扒的),手动放进去也认:
+
+```
+~/.mavis/pets/<your-slug>/
+├── pet.json            # { "frame_w":192, "frame_h":208, "rows":9, "cols":8, "frame_count":6, "frame_duration_ms":1100 }
+└── spritesheet.webp    # 或 spritesheet.png,1536×1872(默认 192×208 × 8×9)
+```
+
+然后 `mavis-pet switch <your-slug>` 就行。
+
+### 跟 codex / petdex-desktop 有什么不一样
+
+| | mavis-pet | codex floater / petdex-desktop |
+|---|---|---|
+| 宠物素材 | petdex 开放格式 | 同上 |
+| 状态来源 | mavis daemon 6 个 hook(对话/工具/Session) | codex 内部钩子 |
+| 进程 | broker (Node) + floater (Tauri/Rust) | 单一 native app |
+| 装法 | npm + cargo build,git clone 装 | macOS app dmg |
+| 气泡 | 状态切换自动飘文字 | 部分支持 |
+| 切宠物 | `mavis-pet switch` 命令 | 右键菜单 / app UI |
+
+简短说:**宠物素材 100% 兼容**,**状态机和 UI 框架不一样**,**功能上 mavis-pet 多了气泡 + 跨 fullscreen**。
+
 ## v0.2 已实现
 
 ### v0.1 基础(2026-05 中)
@@ -68,9 +125,10 @@ mavis-pet start            # broker + floater 都起
 ### v0.2 新增(2026-05-12)
 - [x] 8 状态(从 4 扩到 8,review 留 v0.4)
 - [x] 3 个新 hook event:UserPromptSubmit / SessionStart / SessionEnd
-- [x] **气泡 UI** — codex/petdex 风格 pill bubble + 紫色 brand 徽标
+- [x] **气泡 UI** — codex/petdex 风格 pill bubble + mavis 蓝色 brand 徽标
 - [x] 6 条 mavis hook 自动装(原 3 条 + 新 3 条)
 - [x] window 加大 70×76 → 140×120 容纳气泡
+- [x] **跨 macOS fullscreen Space** — 用 cocoa 设 NSWindowCollectionBehavior FullScreenAuxiliary + CanJoinAllSpaces + window level 101,在别的 app 全屏时也能浮在最上层
 - [x] 38/38 测试全过(原 33 + v0.2 新 5 个)
 - [x] 修复 v0.1 .gitignore 漏 `packages/floater/dist/` 的问题
 
