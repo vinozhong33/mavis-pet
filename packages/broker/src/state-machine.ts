@@ -1,17 +1,23 @@
 /**
  * Pet Broker — state machine.
  *
- * Per-session view:
- *   - PreToolUse                  → session enters RUNNING
- *   - PostToolUse(exitCode == 0)  → keep RUNNING (work continues)
- *   - PostToolUse(exitCode != 0)  → session enters FAILED, auto-degrades
- *                                   after `failedDegradeMs` (default 2000)
- *   - MessageComplete             → transient WAVE for `waveDurationMs`
+ * Per-session view (events drive state):
+ *   - PreToolUse                  → session enters RUNNING (base)
+ *   - PostToolUse(exitCode == 0)  → keep RUNNING
+ *   - PostToolUse(exitCode != 0)  → FAILED overlay, auto-degrade after
+ *                                   `failedDegradeMs` (default 2000)
+ *   - MessageComplete             → WAVE overlay for `waveDurationMs`
  *                                   (default 1000), then degrade
- *   - 30 s of silence (`idleAfterMs`) on a session → session enters IDLE
+ *   - UserPromptSubmit            → JUMP overlay for `jumpDurationMs`
+ *                                   (default 1500), then degrade
+ *   - SessionStart                → EXTRA1 overlay for `bootDurationMs`
+ *                                   (default 2500), then degrade
+ *   - SessionEnd                  → EXTRA2 overlay for `bootDurationMs`,
+ *                                   then forget the session
+ *   - 30 s of silence on a session → session enters IDLE (base)
  *
  * Global aggregation across ALL sessions, highest priority wins:
- *   FAILED > RUNNING > WAVE > IDLE
+ *   FAILED > REVIEW > JUMP > EXTRA1 > EXTRA2 > WAVE > RUN > IDLE
  *
  * Time discipline: every timer goes through the injected {@link Clock} so
  * the entire machine is deterministic in tests.
@@ -36,24 +42,35 @@ export interface StateMachineOptions {
   failedDegradeMs?: number;
   /** ms after which a WAVE session degrades back. Default 1000. */
   waveDurationMs?: number;
+  /** ms after which a JUMP session degrades back. Default 1500. */
+  jumpDurationMs?: number;
+  /** ms after which a SessionStart/End "extra" overlay degrades. Default 2500. */
+  bootDurationMs?: number;
   /** ms of silence before a session is considered IDLE. Default 30000. */
   idleAfterMs?: number;
 }
 
 /** Priority used for global aggregation. Higher number wins. */
 const STATE_PRIORITY: Record<PetState, number> = {
-  failed: 4,
-  run: 3,
-  wave: 2,
+  failed: 8,
+  review: 7,
+  jump: 6,
+  extra1: 5,
+  extra2: 4,
+  wave: 3,
+  run: 2,
   idle: 1,
 };
+
+/** All states that can sit in the per-session overlay slot. */
+type OverlayState = "failed" | "wave" | "jump" | "extra1" | "extra2" | "review";
 
 interface SessionRecord {
   sessionId: string;
   /** "Underlying" state after the most recent definitive event. Either RUNNING or IDLE. */
   baseState: "run" | "idle";
-  /** Transient overlay (FAILED or WAVE) that overrides baseState when active. */
-  overlay: "failed" | "wave" | null;
+  /** Transient overlay that overrides baseState when active. */
+  overlay: OverlayState | null;
   /** Timer for overlay degrade. */
   overlayTimer: TimerHandle | null;
   /** Timer for silent → IDLE degrade. */
@@ -68,6 +85,8 @@ export class StateMachine {
   private readonly clock: Clock;
   private readonly failedDegradeMs: number;
   private readonly waveDurationMs: number;
+  private readonly jumpDurationMs: number;
+  private readonly bootDurationMs: number;
   private readonly idleAfterMs: number;
   private readonly sessions = new Map<string, SessionRecord>();
   private listeners: StateChangeListener[] = [];
@@ -78,6 +97,8 @@ export class StateMachine {
     this.clock = opts.clock;
     this.failedDegradeMs = opts.failedDegradeMs ?? 2_000;
     this.waveDurationMs = opts.waveDurationMs ?? 1_000;
+    this.jumpDurationMs = opts.jumpDurationMs ?? 1_500;
+    this.bootDurationMs = opts.bootDurationMs ?? 2_500;
     this.idleAfterMs = opts.idleAfterMs ?? 30_000;
     this.lastChangeTs = this.clock.now();
   }
@@ -127,6 +148,17 @@ export class StateMachine {
       case "MessageComplete":
         this.applyMessageComplete(session);
         break;
+      case "UserPromptSubmit":
+        this.applyUserPromptSubmit(session);
+        break;
+      case "SessionStart":
+        this.applySessionStart(session);
+        break;
+      case "SessionEnd":
+        this.applySessionEnd(session, now);
+        // SessionEnd schedules its own forget; recompute and return.
+        this.recompute(now);
+        return;
     }
 
     // Each event resets the silence-to-idle timer for that session.
@@ -164,38 +196,56 @@ export class StateMachine {
 
   private applyPreToolUse(s: SessionRecord): void {
     s.baseState = "run";
-    // Pre-tool kills any lingering WAVE; FAILED is intentionally preserved
-    // because PreToolUse can fire WHILE a previous tool is still failing.
-    // Spec says "FAILED 2 秒后回 RUNNING" — the timer handles that, we don't
-    // forcibly clear here.
-    if (s.overlay === "wave") {
+    if (s.overlay === "wave" || s.overlay === "jump") {
       this.clearOverlay(s);
     }
   }
 
   private applyPostToolUse(s: SessionRecord, exitCode: number | undefined): void {
     if (typeof exitCode === "number" && exitCode !== 0) {
-      // Failure → set FAILED overlay with degrade timer.
-      s.baseState = "run"; // session is still alive, just had a hiccup
+      s.baseState = "run";
       this.setOverlay(s, "failed", this.failedDegradeMs);
     } else {
-      // Success → keep baseState=RUNNING. PostToolUse alone does not move
-      // to IDLE; that only happens via silence timeout.
       s.baseState = "run";
-      if (s.overlay === "wave") {
-        // Successful tool replaces any pending WAVE.
+      if (s.overlay === "wave" || s.overlay === "jump") {
         this.clearOverlay(s);
       }
     }
   }
 
   private applyMessageComplete(s: SessionRecord): void {
-    // MessageComplete signals end of an agent turn. We keep baseState as IDLE
-    // because the agent is now waiting on the user; the silence timer would
-    // have eventually moved us there anyway. The transient WAVE overlay is
-    // the visible signal.
+    // Agent finished a turn; we're now waiting on user input.
     s.baseState = "idle";
     this.setOverlay(s, "wave", this.waveDurationMs);
+  }
+
+  private applyUserPromptSubmit(s: SessionRecord): void {
+    // User just sent a new message → short JUMP of joy.
+    // Base resets to idle (agent hasn't tooled yet); next PreToolUse will
+    // flip back to RUNNING and the JUMP timer will already have degraded.
+    s.baseState = "idle";
+    this.setOverlay(s, "jump", this.jumpDurationMs);
+  }
+
+  private applySessionStart(s: SessionRecord): void {
+    // Session boot — short EXTRA1 overlay.
+    s.baseState = "idle";
+    this.setOverlay(s, "extra1", this.bootDurationMs);
+  }
+
+  private applySessionEnd(s: SessionRecord, now: number): void {
+    // EXTRA2 overlay, then the session is dropped after the overlay degrades.
+    if (s.overlayTimer) this.clock.clearTimeout(s.overlayTimer);
+    if (s.idleTimer) this.clock.clearTimeout(s.idleTimer);
+    s.baseState = "idle";
+    s.overlay = "extra2";
+    s.overlayTimer = this.clock.setTimeout(() => {
+      // Drop the session record entirely; SessionEnd is terminal.
+      this.sessions.delete(s.sessionId);
+      this.recompute(this.clock.now());
+    }, this.bootDurationMs);
+    s.idleTimer = null; // no idle timer for a session that's about to be forgotten
+    void now;
   }
 
   // ---------------------------------------------------------------------------
@@ -204,7 +254,7 @@ export class StateMachine {
 
   private setOverlay(
     s: SessionRecord,
-    overlay: "failed" | "wave",
+    overlay: OverlayState,
     durationMs: number,
   ): void {
     if (s.overlayTimer) this.clock.clearTimeout(s.overlayTimer);

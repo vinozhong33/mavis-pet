@@ -300,12 +300,25 @@ async function cmdStatus() {
 
 // ---- hook install/uninstall ----------------------------------------------
 
-interface HookSpec { event: string; matcher?: string; bodyKind: 'pretool' | 'posttool' | 'msgcomplete' }
+interface HookSpec {
+  event: string;
+  matcher?: string;
+  bodyKind:
+    | 'pretool'
+    | 'posttool'
+    | 'msgcomplete'
+    | 'userprompt'
+    | 'sessionstart'
+    | 'sessionend';
+}
 
 const HOOK_SPECS: HookSpec[] = [
   { event: 'PreToolUse', bodyKind: 'pretool' },
   { event: 'PostToolUse', bodyKind: 'posttool' },
   { event: 'MessageComplete', bodyKind: 'msgcomplete' },
+  { event: 'UserPromptSubmit', bodyKind: 'userprompt' },
+  { event: 'SessionStart', bodyKind: 'sessionstart' },
+  { event: 'SessionEnd', bodyKind: 'sessionend' },
 ];
 
 function hookBody(spec: HookSpec): string {
@@ -316,10 +329,21 @@ function hookBody(spec: HookSpec): string {
   // - PreToolUse / PostToolUse: input.sessionId + input.toolName always set.
   // - PostToolUse: hookInput does NOT carry exitCode; we sniff toolResult
   //   for "error"/"failed" tokens to drive the failed flash.
-  // - MessageComplete: input.sessionId set; toolName empty.
+  // - MessageComplete / UserPromptSubmit / SessionStart / SessionEnd:
+  //   input.sessionId set; toolName empty.
   const post = (jsonPayload: string) =>
     `curl -sS -m 1 -X POST -H "content-type: application/json" ` +
     `-d "${jsonPayload}" ${BROKER_URL}/event >/dev/null 2>&1 || true`;
+
+  const sessionOnly = (kind: string, comment: string) =>
+    [
+      '```bash',
+      `# mavis-pet ${comment}`,
+      'IN=$(cat)',
+      'SID=$(printf "%s" "$IN" | /usr/bin/jq -r ".input.sessionId // empty")',
+      post(`{\\"sessionId\\":\\"$SID\\",\\"kind\\":\\"${kind}\\"}`),
+      '```',
+    ].join('\n');
 
   if (spec.bodyKind === 'pretool') {
     return [
@@ -346,15 +370,17 @@ function hookBody(spec: HookSpec): string {
       '```',
     ].join('\n');
   }
-  // msgcomplete
-  return [
-    '```bash',
-    '# mavis-pet MessageComplete — short wave at end of agent reply',
-    'IN=$(cat)',
-    'SID=$(printf "%s" "$IN" | /usr/bin/jq -r ".input.sessionId // empty")',
-    post('{\\"sessionId\\":\\"$SID\\",\\"kind\\":\\"MessageComplete\\"}'),
-    '```',
-  ].join('\n');
+  if (spec.bodyKind === 'msgcomplete') {
+    return sessionOnly('MessageComplete', 'MessageComplete — short wave at end of agent reply');
+  }
+  if (spec.bodyKind === 'userprompt') {
+    return sessionOnly('UserPromptSubmit', 'UserPromptSubmit — happy hop when the user sends a new message');
+  }
+  if (spec.bodyKind === 'sessionstart') {
+    return sessionOnly('SessionStart', 'SessionStart — boot greeting overlay');
+  }
+  // sessionend
+  return sessionOnly('SessionEnd', 'SessionEnd — farewell overlay (session is then forgotten)');
 }
 
 async function cmdHookInstall() {
@@ -417,7 +443,9 @@ function usage() {
   mavis-pet start               start broker + floater
   mavis-pet stop                stop floater + broker
   mavis-pet status              show pet/broker/floater/hook status
-  mavis-pet hook install        register the 3 mavis hooks (Pre/PostToolUse, MessageComplete)
+  mavis-pet hook install        register the 6 mavis hooks (Pre/PostToolUse,
+                                MessageComplete, UserPromptSubmit,
+                                SessionStart, SessionEnd)
   mavis-pet hook uninstall      remove those hooks
 
 Env:

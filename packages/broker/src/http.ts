@@ -22,6 +22,9 @@ const VALID_KINDS: ReadonlySet<HookEventKind> = new Set([
   "PreToolUse",
   "PostToolUse",
   "MessageComplete",
+  "UserPromptSubmit",
+  "SessionStart",
+  "SessionEnd",
 ]);
 
 /** Broadcaster contract — implemented by the WS hub. */

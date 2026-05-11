@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>mavis-pet</title>
+    <style>
+      :root { color-scheme: light dark; }
+      html, body {
+        margin: 0; padding: 0;
+        width: 100vw; height: 100vh;
+        background: transparent !important;
+        overflow: hidden;
+        cursor: grab;
+        user-select: none;
+        font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
+      }
+      body:active { cursor: grabbing; }
+      .stage {
+        position: relative;
+        width: 100%; height: 100%;
+        background: transparent;
+        overflow: hidden;
+      }
+      /* Pet anchored at the bottom-RIGHT; bubble floats top-LEFT,
+         mirroring the codex/petdex floater layout. */
+      .pet {
+        position: absolute;
+        right: 8px;
+        bottom: 4px;
+        background-repeat: no-repeat;
+        image-rendering: pixelated;
+        will-change: background-position;
+        pointer-events: auto;
+        /* JS sets width/height to ONE scaled frame; background-size to the
+           scaled FULL sheet; background-position to the row offset. */
+      }
+      /* Speech bubble — pill shape with a small brand badge on the left.
+         Codex/petdex style: no tail, generous radius, soft drop shadow. */
+      .bubble {
+        position: absolute;
+        top: 6px;
+        left: 6px;
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        max-width: 124px;
+        padding: 4px 10px 4px 4px;
+        background: #ffffff;
+        color: #1a1a1a;
+        border: 1px solid rgba(0, 0, 0, 0.06);
+        border-radius: 999px;
+        box-shadow: 0 2px 10px rgba(0, 0, 0, 0.18),
+                    0 1px 2px rgba(0, 0, 0, 0.08);
+        font-size: 13px;
+        line-height: 1.15;
+        font-weight: 600;
+        letter-spacing: 0.1px;
+        white-space: nowrap;
+        opacity: 0;
+        transform: translateY(-2px);
+        pointer-events: none;
+        transition: opacity 200ms ease-out, transform 200ms ease-out;
+      }
+      .bubble.show { opacity: 1; transform: translateY(0); }
+      .bubble .badge {
+        flex: 0 0 auto;
+        width: 20px;
+        height: 20px;
+        border-radius: 50%;
+        background: linear-gradient(135deg, #7c6df2, #5b4cd6);
+        color: #ffffff;
+        font-size: 11px;
+        font-weight: 700;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        box-shadow: inset 0 -1px 0 rgba(0, 0, 0, 0.15);
+      }
+      .bubble .text {
+        display: inline-block;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      @media (prefers-color-scheme: dark) {
+        .bubble {
+          background: #ffffff;   /* keep light bubble for contrast on dark wallpapers */
+          color: #1a1a1a;
+        }
+      }
+
+      /* Use --frames (real animated frames per row, default 6) for steps,
+         not --cols (full grid columns). Each step shifts background-position
+         by exactly one frame width. */
+      .pet.idle    { animation: row-idle    var(--dur, 1100ms) steps(var(--frames, 6)) infinite; }
+      .pet.wave    { animation: row-wave    var(--dur, 1100ms) steps(var(--frames, 6)) infinite; }
+      .pet.run     { animation: row-run     var(--dur, 1100ms) steps(var(--frames, 6)) infinite; }
+      .pet.failed  { animation: row-failed  var(--dur, 1100ms) steps(var(--frames, 6)) infinite; }
+      .pet.review  { animation: row-review  var(--dur, 1100ms) steps(var(--frames, 6)) infinite; }
+      .pet.jump    { animation: row-jump    var(--dur, 1100ms) steps(var(--frames, 6)) infinite; }
+      .pet.extra1  { animation: row-extra1  var(--dur, 1100ms) steps(var(--frames, 6)) infinite; }
+      .pet.extra2  { animation: row-extra2  var(--dur, 1100ms) steps(var(--frames, 6)) infinite; }
+
+      /* Each keyframe scrolls horizontally over `--frames` frames of width
+         --frame-w pixels, while keeping the row Y fixed. */
+      @keyframes row-idle    { from { background-position: 0 var(--row-idle-y);    } to { background-position: calc(var(--frames) * var(--frame-w) * -1px) var(--row-idle-y);    } }
+      @keyframes row-wave    { from { background-position: 0 var(--row-wave-y);    } to { background-position: calc(var(--frames) * var(--frame-w) * -1px) var(--row-wave-y);    } }
+      @keyframes row-run     { from { background-position: 0 var(--row-run-y);     } to { background-position: calc(var(--frames) * var(--frame-w) * -1px) var(--row-run-y);     } }
+      @keyframes row-failed  { from { background-position: 0 var(--row-failed-y);  } to { background-position: calc(var(--frames) * var(--frame-w) * -1px) var(--row-failed-y);  } }
+      @keyframes row-review  { from { background-position: 0 var(--row-review-y);  } to { background-position: calc(var(--frames) * var(--frame-w) * -1px) var(--row-review-y);  } }
+      @keyframes row-jump    { from { background-position: 0 var(--row-jump-y);    } to { background-position: calc(var(--frames) * var(--frame-w) * -1px) var(--row-jump-y);    } }
+      @keyframes row-extra1  { from { background-position: 0 var(--row-extra1-y); } to { background-position: calc(var(--frames) * var(--frame-w) * -1px) var(--row-extra1-y); } }
+      @keyframes row-extra2  { from { background-position: 0 var(--row-extra2-y); } to { background-position: calc(var(--frames) * var(--frame-w) * -1px) var(--row-extra2-y); } }
+    </style>
+  </head>
+  <body data-tauri-drag-region>
+    <div class="stage" data-tauri-drag-region>
+      <div class="bubble" id="bubble">
+        <span class="badge">M</span>
+        <span class="text" id="bubble-text"></span>
+      </div>
+      <div class="pet idle" id="pet" data-tauri-drag-region></div>
+    </div>
+    <script>
+      const STATES = ['idle', 'wave', 'run', 'failed', 'review', 'jump', 'extra1', 'extra2'];
+      const invoke = window.__TAURI__?.core?.invoke ?? window.__TAURI_INTERNALS__?.invoke;
+      const listen = window.__TAURI__?.event?.listen;
+
+      const petEl = document.getElementById('pet');
+      const bubbleEl = document.getElementById('bubble');
+      const bubbleTextEl = document.getElementById('bubble-text');
+      let currentState = 'idle';
+      let bubbleHideTimer = null;
+
+      async function loadPet(slug = null) {
+        if (!invoke) { console.error('[mavis-pet] Tauri invoke not available'); return; }
+        try {
+          const args = slug ? { slug } : {};
+          const p = await invoke('get_pet', args);
+
+          // Visual scale — codex floater renders sprite at roughly this fraction
+          // of the raw frame on Retina. Lower = smaller pet.
+          const SCALE = 0.3;
+          const scaledFrameW = Math.round(p.frame_w * SCALE);
+          const scaledFrameH = Math.round(p.frame_h * SCALE);
+
+          console.log('[mavis-pet] pet payload:', {
+            slug: p.slug, frame_w: p.frame_w, frame_h: p.frame_h,
+            rows: p.rows, cols: p.cols, frame_count: p.frame_count,
+            scaled: `${scaledFrameW}x${scaledFrameH}`,
+          });
+
+          // Element: ONE scaled frame; bg-image: full sheet, bg-size: scaled full sheet.
+          petEl.style.width = `${scaledFrameW}px`;
+          petEl.style.height = `${scaledFrameH}px`;
+          petEl.style.backgroundImage = `url("data:${p.mime};base64,${p.sprite_b64}")`;
+          petEl.style.backgroundSize = `${p.cols * scaledFrameW}px ${p.rows * scaledFrameH}px`;
+          petEl.style.setProperty('--frame-w', scaledFrameW);
+          petEl.style.setProperty('--frame-h', scaledFrameH);
+          petEl.style.setProperty('--cols', p.cols);
+          petEl.style.setProperty('--rows', p.rows);
+          petEl.style.setProperty('--frames', p.frame_count || 6);
+          petEl.style.setProperty('--dur', `${p.frame_duration_ms}ms`);
+          STATES.forEach((s, idx) => {
+            petEl.style.setProperty(`--row-${s}-y`, `-${idx * scaledFrameH}px`);
+          });
+          console.log(`[mavis-pet] loaded ${p.slug}`);
+        } catch (e) {
+          console.error('[mavis-pet] loadPet failed:', e);
+        }
+      }
+
+      function setState(state) {
+        if (!STATES.includes(state)) {
+          console.warn('[mavis-pet] unknown state:', state); return;
+        }
+        if (state === currentState) return;
+        petEl.classList.remove(currentState);
+        petEl.classList.add(state);
+        currentState = state;
+      }
+
+      function showBubble(text, ttlMs) {
+        if (typeof text !== 'string' || text.length === 0) return;
+        bubbleTextEl.textContent = text;
+        bubbleEl.classList.add('show');
+        if (bubbleHideTimer) {
+          clearTimeout(bubbleHideTimer);
+          bubbleHideTimer = null;
+        }
+        const ttl = typeof ttlMs === 'number' && ttlMs > 0 ? ttlMs : 2500;
+        bubbleHideTimer = setTimeout(() => {
+          bubbleEl.classList.remove('show');
+          bubbleHideTimer = null;
+        }, ttl);
+      }
+
+      // ---- WS client -----------------------------------------------------
+      const WS_URL = 'ws://127.0.0.1:7857/ws';
+      let ws = null;
+      let backoffMs = 500;
+      const MAX_BACKOFF = 30000;
+
+      function connect() {
+        try { ws = new WebSocket(WS_URL); } catch { scheduleReconnect(); return; }
+        ws.onopen = () => { console.log('[mavis-pet] WS connected'); backoffMs = 500; };
+        ws.onmessage = (ev) => {
+          try {
+            const msg = JSON.parse(ev.data);
+            if (msg.type === 'state' && typeof msg.state === 'string') {
+              setState(msg.state);
+              if (msg.bubble) showBubble(msg.bubble, msg.bubbleTtlMs);
+            } else if (msg.type === 'pet' && typeof msg.slug === 'string') {
+              loadPet(msg.slug);
+            }
+          } catch { /* ignore non-JSON */ }
+        };
+        ws.onclose = () => { ws = null; scheduleReconnect(); };
+        ws.onerror = () => { /* onclose follows */ };
+      }
+      function scheduleReconnect() {
+        const wait = Math.min(backoffMs, MAX_BACKOFF);
+        backoffMs = Math.min(backoffMs * 2, MAX_BACKOFF);
+        setTimeout(connect, wait);
+      }
+
+      if (listen) listen('pet-reload', () => loadPet(null));
+
+      window.addEventListener('DOMContentLoaded', () => {
+        loadPet(null);
+        connect();
+
+        // Manual drag — Tauri v2 data-tauri-drag-region is unreliable on
+        // transparent windows; do it ourselves with startDragging().
+        // Source: https://v2.tauri.app/learn/window-customization/
+        document.body.addEventListener('mousedown', async (e) => {
+          if (e.button !== 0) return;          // left button only
+          try {
+            const w = window.__TAURI__?.window?.getCurrentWindow?.();
+            if (w?.startDragging) {
+              await w.startDragging();
+            } else if (window.__TAURI_INTERNALS__?.invoke) {
+              await window.__TAURI_INTERNALS__.invoke('plugin:window|start_dragging');
+            }
+          } catch (err) {
+            console.error('[mavis-pet] startDragging failed:', err);
+          }
+        });
+      });
+    </script>
+  </body>
+</html>

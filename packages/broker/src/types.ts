@@ -1,17 +1,44 @@
 /**
  * Pet Broker — public type definitions.
  *
- * These are the contracts consumed by:
+ * Consumed by:
  *   - State machine (per-session/global aggregation)
  *   - HTTP server (POST /event from mavis hooks)
  *   - WebSocket server (broadcast to floater clients)
  */
 
-/** Aggregated pet animation state, sorted by priority (highest wins). */
-export type PetState = "failed" | "run" | "wave" | "idle";
+/**
+ * Aggregated pet animation state, sorted by priority (highest wins).
+ *
+ * Priority order (top = wins):
+ *   failed > review > jump > extra1 > extra2 > run > wave > idle
+ *
+ * Notes:
+ *   - failed / wave / jump / extra1 / extra2 are TRANSIENT overlays that
+ *     auto-degrade after a short TTL.
+ *   - run is the per-session "base" state during a tool-using session.
+ *   - idle is the default when no session is active and no overlay is set.
+ *   - review is reserved for "agent waiting on user decision" (v0.4 polling
+ *     against mavis daemon — not wired in v0.3).
+ */
+export type PetState =
+  | "failed"
+  | "review"
+  | "jump"
+  | "extra1"
+  | "extra2"
+  | "run"
+  | "wave"
+  | "idle";
 
 /** Hook event kinds we currently understand. */
-export type HookEventKind = "PreToolUse" | "PostToolUse" | "MessageComplete";
+export type HookEventKind =
+  | "PreToolUse"
+  | "PostToolUse"
+  | "MessageComplete"
+  | "UserPromptSubmit"
+  | "SessionStart"
+  | "SessionEnd";
 
 /** Inbound HTTP event payload (`POST /event`). */
 export interface HookEvent {
@@ -36,11 +63,19 @@ export interface SessionStatus {
   lastEventKind?: HookEventKind;
 }
 
-/** Outbound WebSocket message: state push. */
+/**
+ * Outbound WebSocket message: state push.
+ *
+ * Optional `bubble` field carries a short speech-bubble string the floater
+ * should render above the pet. `bubbleTtlMs` controls auto-dismiss
+ * (defaults to 2500ms client-side if absent).
+ */
 export interface WsStateMessage {
   type: "state";
   state: PetState;
   ts: number;
+  bubble?: string;
+  bubbleTtlMs?: number;
 }
 
 /** Outbound WebSocket message: pet (slug) switch. */

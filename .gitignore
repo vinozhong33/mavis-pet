@@ -5,6 +5,11 @@
 **/gen/
 **/*.tsbuildinfo
 
+# Floater frontend is source (handwritten HTML embedded by Tauri at build time),
+# not a build artifact. Override the **/dist/ rule above for this one path.
+!packages/floater/dist/
+!packages/floater/dist/**
+
 # Tauri / Cargo
 packages/floater/Cargo.lock
 packages/floater/target/

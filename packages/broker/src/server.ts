@@ -13,7 +13,7 @@ import { createHttpHandler, startHttpServer } from "./http.js";
 import { type Logger, createLogger } from "./logger.js";
 import { StateMachine } from "./state-machine.js";
 import { WsHub } from "./ws.js";
-import type { HookEvent } from "./types.js";
+import type { HookEvent, PetState } from "./types.js";
 
 export const DEFAULT_HOST = "127.0.0.1";
 export const DEFAULT_PORT = 7857;
@@ -30,7 +30,16 @@ export interface BrokerOptions {
   /** State machine knobs for tests / advanced configs. */
   failedDegradeMs?: number;
   waveDurationMs?: number;
+  jumpDurationMs?: number;
+  bootDurationMs?: number;
   idleAfterMs?: number;
+  /**
+   * Override / extend default speech bubbles. Keys are PetState; values are
+   * either a short string or `null` to suppress the bubble for that state.
+   */
+  bubbles?: Partial<Record<PetState, string | null>>;
+  /** Default time-to-live (ms) for bubbles. Defaults to 2500. */
+  bubbleTtlMs?: number;
 }
 
 export interface BrokerHandle {
@@ -46,6 +55,21 @@ export interface BrokerHandle {
   close(): Promise<void>;
 }
 
+/**
+ * Default speech-bubble copy per state. Short, friendly, English by default
+ * to keep the floater locale-agnostic. Override via {@link BrokerOptions.bubbles}.
+ */
+const DEFAULT_BUBBLES: Record<PetState, string | null> = {
+  failed: "oops",
+  review: "your turn",
+  jump: "hey!",
+  extra1: "morning",
+  extra2: "bye",
+  wave: "done!",
+  run: null,
+  idle: null,
+};
+
 export async function startBroker(opts: BrokerOptions = {}): Promise<BrokerHandle> {
   const host = opts.host ?? DEFAULT_HOST;
   const port = opts.port ?? DEFAULT_PORT;
@@ -56,12 +80,20 @@ export async function startBroker(opts: BrokerOptions = {}): Promise<BrokerHandl
     clock,
     failedDegradeMs: opts.failedDegradeMs,
     waveDurationMs: opts.waveDurationMs,
+    jumpDurationMs: opts.jumpDurationMs,
+    bootDurationMs: opts.bootDurationMs,
     idleAfterMs: opts.idleAfterMs,
   });
 
   const petRef = { slug: opts.pet ?? null };
   const recentEvents: HookEvent[] = [];
   const startedAt = clock.now();
+
+  const bubbles: Record<PetState, string | null> = {
+    ...DEFAULT_BUBBLES,
+    ...(opts.bubbles ?? {}),
+  };
+  const bubbleTtlMs = opts.bubbleTtlMs ?? 2_500;
 
   const hub = new WsHub({
     clock,
@@ -73,8 +105,15 @@ export async function startBroker(opts: BrokerOptions = {}): Promise<BrokerHandl
     getCurrentPet: () => petRef.slug,
   });
 
-  // Wire state changes → broadcast.
-  machine.onChange((state, ts) => hub.broadcastState(state, ts));
+  // Wire state changes → broadcast (with optional speech bubble).
+  machine.onChange((state, ts) => {
+    const text = bubbles[state];
+    if (text) {
+      hub.broadcastState(state, ts, { bubble: text, bubbleTtlMs });
+    } else {
+      hub.broadcastState(state, ts);
+    }
+  });
 
   const handler = createHttpHandler({
     machine,

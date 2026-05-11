@@ -96,16 +96,15 @@ describe("StateMachine", () => {
   // ---------------------------------------------------------------------------
   // Spec scenario 3: multi-session, one RUNNING + one IDLE → global RUNNING
   // ---------------------------------------------------------------------------
-  it("multi-session: one RUNNING + one IDLE → global RUNNING", () => {
+  it("multi-session: one RUNNING + one IDLE → after WAVE expires, global RUNNING", () => {
     m.ingest({ kind: "PreToolUse", sessionId: "s_active" });
     m.ingest({ kind: "MessageComplete", sessionId: "s_done" });
 
-    // s_done has WAVE overlay → contributes WAVE for 1s.
-    // s_active has baseState=run.
-    // Global priority: failed > run > wave > idle, so global = run.
-    expect(m.globalState).toBe("run");
+    // s_done has WAVE overlay (priority 3) > s_active's RUN (priority 2),
+    // so global is briefly WAVE while the overlay is active.
+    expect(m.globalState).toBe("wave");
 
-    // After WAVE expires, s_done baseState=idle, s_active still run → global stays run.
+    // After WAVE expires, s_done baseState=idle, s_active still run → global=run.
     clock.advance(1_001);
     expect(m.globalState).toBe("run");
   });
@@ -156,15 +155,16 @@ describe("StateMachine", () => {
     expect(seq.at(-1)).toBe("idle");
   });
 
-  it("MessageComplete during RUNNING session: WAVE briefly, then global goes back to RUN if other session still active", () => {
+  it("MessageComplete during RUNNING session: WAVE overlay wins, then degrades back to RUN", () => {
     m.ingest({ kind: "PreToolUse", sessionId: "s_busy" });
     expect(m.globalState).toBe("run");
 
     m.ingest({ kind: "MessageComplete", sessionId: "s_done" });
-    // wave priority < run priority, so global stays run.
-    expect(m.globalState).toBe("run");
+    // wave overlay (priority 3) > run (priority 2), so global flips to wave briefly.
+    expect(m.globalState).toBe("wave");
 
     clock.advance(1_500);
+    // wave overlay expired, s_done baseState=idle, s_busy still run → global=run.
     expect(m.globalState).toBe("run");
   });
 
@@ -180,6 +180,80 @@ describe("StateMachine", () => {
     expect(m.globalState).toBe("run");
 
     m.ingest({ kind: "PostToolUse", sessionId: "s1", exitCode: 2 });
+    expect(m.globalState).toBe("failed");
+  });
+
+  // ---------------------------------------------------------------------------
+  // v0.2 — UserPromptSubmit → JUMP
+  // ---------------------------------------------------------------------------
+  it("UserPromptSubmit → JUMP for 1.5s, then degrades to idle", () => {
+    m.ingest({ kind: "UserPromptSubmit", sessionId: "s1" });
+    expect(m.globalState).toBe("jump");
+
+    clock.advance(1_499);
+    expect(m.globalState).toBe("jump");
+
+    clock.advance(2);
+    expect(m.globalState).toBe("idle");
+  });
+
+  it("JUMP overlay beats RUN in aggregation", () => {
+    m.ingest({ kind: "PreToolUse", sessionId: "s_busy" });
+    expect(m.globalState).toBe("run");
+
+    m.ingest({ kind: "UserPromptSubmit", sessionId: "s_input" });
+    // jump (6) > run (2)
+    expect(m.globalState).toBe("jump");
+
+    clock.advance(1_600);
+    // jump overlay expired; s_busy still running.
+    expect(m.globalState).toBe("run");
+  });
+
+  // ---------------------------------------------------------------------------
+  // v0.2 — SessionStart → EXTRA1, SessionEnd → EXTRA2 + forget
+  // ---------------------------------------------------------------------------
+  it("SessionStart → EXTRA1 for 2.5s, then degrades", () => {
+    m.ingest({ kind: "SessionStart", sessionId: "s_boot" });
+    expect(m.globalState).toBe("extra1");
+
+    clock.advance(2_499);
+    expect(m.globalState).toBe("extra1");
+
+    clock.advance(2);
+    expect(m.globalState).toBe("idle");
+  });
+
+  it("SessionEnd → EXTRA2 then forgets the session", () => {
+    m.ingest({ kind: "PreToolUse", sessionId: "s1" });
+    expect(m.globalState).toBe("run");
+
+    m.ingest({ kind: "SessionEnd", sessionId: "s1" });
+    expect(m.globalState).toBe("extra2");
+    expect(m.snapshotSessions().some((s) => s.sessionId === "s1")).toBe(true);
+
+    clock.advance(2_600);
+    // EXTRA2 overlay expired AND session was forgotten.
+    expect(m.globalState).toBe("idle");
+    expect(m.snapshotSessions().some((s) => s.sessionId === "s1")).toBe(false);
+  });
+
+  it("priority order: FAILED > REVIEW > JUMP > EXTRA1 > EXTRA2 > WAVE > RUN > IDLE", () => {
+    // EXTRA2 vs RUN — extra2 wins.
+    m.ingest({ kind: "PreToolUse", sessionId: "s_run" });
+    m.ingest({ kind: "SessionEnd", sessionId: "s_end" });
+    expect(m.globalState).toBe("extra2");
+
+    // Add EXTRA1 — beats EXTRA2.
+    m.ingest({ kind: "SessionStart", sessionId: "s_boot" });
+    expect(m.globalState).toBe("extra1");
+
+    // Add JUMP — beats EXTRA1.
+    m.ingest({ kind: "UserPromptSubmit", sessionId: "s_input" });
+    expect(m.globalState).toBe("jump");
+
+    // Add FAILED — beats everything.
+    m.ingest({ kind: "PostToolUse", sessionId: "s_run", exitCode: 1 });
     expect(m.globalState).toBe("failed");
   });
 
