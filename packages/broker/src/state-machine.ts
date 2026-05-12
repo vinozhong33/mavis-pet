@@ -231,8 +231,12 @@ export class StateMachine {
   }
 
   private applyMessageComplete(s: SessionRecord): void {
-    // Agent finished a turn; we're now waiting on user input.
-    s.baseState = "idle";
+    // mavis daemon emits MessageComplete per reply segment, sometimes multiple
+    // times during a long answer. v0.3.1 set baseState=idle here, which made
+    // the pet stop animating mid-reply (after the wave overlay degraded).
+    // v0.3.2: keep baseState as-is — the silence timer (30s) or SessionEnd
+    // decides when the session really goes idle. Just flash the wave overlay
+    // for the "done!" bubble.
     this.setOverlay(s, "wave", this.waveDurationMs);
   }
 
