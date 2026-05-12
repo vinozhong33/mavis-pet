@@ -24,6 +24,8 @@ beforeEach(async () => {
     failedDegradeMs: 200,
     waveDurationMs: 100,
     idleAfterMs: 800,
+    // Tests should not poll a real mavis daemon — disable the perm poller.
+    disablePermPoller: true,
   });
 });
 

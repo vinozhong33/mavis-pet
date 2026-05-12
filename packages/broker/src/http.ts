@@ -25,6 +25,8 @@ const VALID_KINDS: ReadonlySet<HookEventKind> = new Set([
   "UserPromptSubmit",
   "SessionStart",
   "SessionEnd",
+  "PermissionRequested",
+  "PermissionResolved",
 ]);
 
 /** Broadcaster contract — implemented by the WS hub. */

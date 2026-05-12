@@ -1,5 +1,5 @@
 /**
- * Broker server bootstrap — wires StateMachine + HTTP + WS together.
+ * Broker server bootstrap — wires StateMachine + HTTP + WS + perm poller together.
  *
  * Public entry: {@link startBroker} returns a {@link BrokerHandle} for tests
  * and lifecycle management. The CLI in `src/main.ts` is a thin wrapper.
@@ -13,6 +13,7 @@ import { createHttpHandler, startHttpServer } from "./http.js";
 import { type Logger, createLogger } from "./logger.js";
 import { StateMachine } from "./state-machine.js";
 import { WsHub } from "./ws.js";
+import { type PermPoller, startPermPoller } from "./perm-poller.js";
 import type { HookEvent, PetState } from "./types.js";
 
 export const DEFAULT_HOST = "127.0.0.1";
@@ -40,6 +41,15 @@ export interface BrokerOptions {
   bubbles?: Partial<Record<PetState, string | null>>;
   /** Default time-to-live (ms) for bubbles. Defaults to 2500. */
   bubbleTtlMs?: number;
+  /**
+   * Disable the mavis daemon permission poller (default: enabled).
+   * Tests typically want to disable this so they don't try to fetch a daemon.
+   */
+  disablePermPoller?: boolean;
+  /** Override daemon URL for the perm poller. Default http://127.0.0.1:15321. */
+  daemonUrl?: string;
+  /** Perm poll interval in ms. Default 1500. */
+  permPollIntervalMs?: number;
 }
 
 export interface BrokerHandle {
@@ -51,17 +61,18 @@ export interface BrokerHandle {
   hub: WsHub;
   http: HttpServer;
   wss: WebSocketServer;
+  /** Perm poller handle (null if disabled). */
+  permPoller: PermPoller | null;
   /** Graceful shutdown. */
   close(): Promise<void>;
 }
 
 /**
- * Default speech-bubble copy per state. Short, friendly, English by default
- * to keep the floater locale-agnostic. Override via {@link BrokerOptions.bubbles}.
+ * Default speech-bubble copy per state. Override via {@link BrokerOptions.bubbles}.
  */
 const DEFAULT_BUBBLES: Record<PetState, string | null> = {
   failed: "oops",
-  review: "your turn",
+  review: "等你 allow",
   jump: "hey!",
   extra1: "morning",
   extra2: "bye",
@@ -106,12 +117,22 @@ export async function startBroker(opts: BrokerOptions = {}): Promise<BrokerHandl
   });
 
   // Wire state changes → broadcast (with optional speech bubble).
+  // REVIEW is a sticky state — its bubble should NOT auto-dismiss while
+  // it's active, so emit it without TTL (floater treats undefined ttl as
+  // "stay until next state").
   machine.onChange((state, ts) => {
     const text = bubbles[state];
-    if (text) {
-      hub.broadcastState(state, ts, { bubble: text, bubbleTtlMs });
-    } else {
+    if (!text) {
       hub.broadcastState(state, ts);
+      return;
+    }
+    if (state === "review") {
+      // Sticky bubble — no TTL. Floater will keep showing until the next
+      // state push (typically Permission Resolved → state changes to whatever
+      // comes next, which carries its own bubble or no bubble).
+      hub.broadcastState(state, ts, { bubble: text });
+    } else {
+      hub.broadcastState(state, ts, { bubble: text, bubbleTtlMs });
     }
   });
 
@@ -142,10 +163,23 @@ export async function startBroker(opts: BrokerOptions = {}): Promise<BrokerHandl
     }
   });
 
+  // Start the mavis daemon perm poller (unless disabled, e.g. in tests).
+  let permPoller: PermPoller | null = null;
+  if (!opts.disablePermPoller) {
+    permPoller = startPermPoller({
+      clock,
+      machine,
+      daemonUrl: opts.daemonUrl,
+      intervalMs: opts.permPollIntervalMs,
+      logger,
+    });
+  }
+
   logger.info("broker_started", {
     host,
     port: address.port,
     pet: petRef.slug,
+    permPoller: permPoller !== null,
   });
 
   return {
@@ -156,8 +190,10 @@ export async function startBroker(opts: BrokerOptions = {}): Promise<BrokerHandl
     hub,
     http,
     wss,
+    permPoller,
     async close() {
       logger.info("broker_stopping");
+      if (permPoller) permPoller.stop();
       hub.closeAll();
       await new Promise<void>((resolve) => {
         wss.close(() => resolve());

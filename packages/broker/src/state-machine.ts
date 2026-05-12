@@ -14,6 +14,11 @@
  *                                   (default 2500), then degrade
  *   - SessionEnd                  → EXTRA2 overlay for `bootDurationMs`,
  *                                   then forget the session
+ *   - PermissionRequested         → REVIEW state (sticky, no TTL).
+ *                                   Lives on a separate slot from the
+ *                                   transient overlays so a brief FAILED
+ *                                   flash doesn't lose the review signal.
+ *   - PermissionResolved          → REVIEW cleared
  *   - 30 s of silence on a session → session enters IDLE (base)
  *
  * Global aggregation across ALL sessions, highest priority wins:
@@ -62,8 +67,8 @@ const STATE_PRIORITY: Record<PetState, number> = {
   idle: 1,
 };
 
-/** All states that can sit in the per-session overlay slot. */
-type OverlayState = "failed" | "wave" | "jump" | "extra1" | "extra2" | "review";
+/** Transient overlays — auto-degrade after a TTL. */
+type OverlayState = "failed" | "wave" | "jump" | "extra1" | "extra2";
 
 interface SessionRecord {
   sessionId: string;
@@ -73,6 +78,12 @@ interface SessionRecord {
   overlay: OverlayState | null;
   /** Timer for overlay degrade. */
   overlayTimer: TimerHandle | null;
+  /**
+   * Sticky REVIEW signal — set by PermissionRequested, cleared by
+   * PermissionResolved. Independent of `overlay` so a brief FAILED flash
+   * (or any other transient overlay) doesn't lose the review signal.
+   */
+  reviewActive: boolean;
   /** Timer for silent → IDLE degrade. */
   idleTimer: TimerHandle | null;
   lastEventTs: number;
@@ -159,6 +170,12 @@ export class StateMachine {
         // SessionEnd schedules its own forget; recompute and return.
         this.recompute(now);
         return;
+      case "PermissionRequested":
+        this.applyPermissionRequested(session);
+        break;
+      case "PermissionResolved":
+        this.applyPermissionResolved(session);
+        break;
     }
 
     // Each event resets the silence-to-idle timer for that session.
@@ -238,6 +255,8 @@ export class StateMachine {
     if (s.overlayTimer) this.clock.clearTimeout(s.overlayTimer);
     if (s.idleTimer) this.clock.clearTimeout(s.idleTimer);
     s.baseState = "idle";
+    // Session is leaving — drop any sticky review signal too.
+    s.reviewActive = false;
     s.overlay = "extra2";
     s.overlayTimer = this.clock.setTimeout(() => {
       // Drop the session record entirely; SessionEnd is terminal.
@@ -246,6 +265,15 @@ export class StateMachine {
     }, this.bootDurationMs);
     s.idleTimer = null; // no idle timer for a session that's about to be forgotten
     void now;
+  }
+
+  private applyPermissionRequested(s: SessionRecord): void {
+    // Sticky — no TTL. Cleared by PermissionResolved or SessionEnd.
+    s.reviewActive = true;
+  }
+
+  private applyPermissionResolved(s: SessionRecord): void {
+    s.reviewActive = false;
   }
 
   // ---------------------------------------------------------------------------
@@ -289,6 +317,7 @@ export class StateMachine {
         baseState: "idle",
         overlay: null,
         overlayTimer: null,
+        reviewActive: false,
         idleTimer: null,
         lastEventTs: this.clock.now(),
       };
@@ -301,8 +330,23 @@ export class StateMachine {
   // Internal: aggregation
   // ---------------------------------------------------------------------------
 
-  /** What this session contributes to the global aggregation. */
+  /**
+   * What this session contributes to the global aggregation.
+   *
+   * Resolution order (top wins):
+   *   FAILED transient overlay > REVIEW (sticky) > other transient overlay
+   *   (jump/extra1/extra2/wave) > baseState (run/idle).
+   *
+   * Because REVIEW lives in a separate slot from the transient overlays, a
+   * brief FAILED flash (2s) doesn't drop the user-perm signal — once FAILED
+   * times out we fall back to REVIEW automatically.
+   */
   private effectiveState(s: SessionRecord): PetState {
+    // FAILED beats everything (including REVIEW).
+    if (s.overlay === "failed") return "failed";
+    // Sticky REVIEW beats lower-priority transient overlays.
+    if (s.reviewActive) return "review";
+    // Other transient overlays.
     if (s.overlay) return s.overlay;
     return s.baseState;
   }

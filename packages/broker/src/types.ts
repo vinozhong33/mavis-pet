@@ -11,15 +11,16 @@
  * Aggregated pet animation state, sorted by priority (highest wins).
  *
  * Priority order (top = wins):
- *   failed > review > jump > extra1 > extra2 > run > wave > idle
+ *   failed > review > jump > extra1 > extra2 > wave > run > idle
  *
  * Notes:
  *   - failed / wave / jump / extra1 / extra2 are TRANSIENT overlays that
  *     auto-degrade after a short TTL.
+ *   - review is a STICKY overlay (no TTL) — set by PermissionRequested,
+ *     cleared by PermissionResolved. Used to signal "agent is waiting on
+ *     a user perm decision".
  *   - run is the per-session "base" state during a tool-using session.
  *   - idle is the default when no session is active and no overlay is set.
- *   - review is reserved for "agent waiting on user decision" (v0.4 polling
- *     against mavis daemon — not wired in v0.3).
  */
 export type PetState =
   | "failed"
@@ -38,7 +39,9 @@ export type HookEventKind =
   | "MessageComplete"
   | "UserPromptSubmit"
   | "SessionStart"
-  | "SessionEnd";
+  | "SessionEnd"
+  | "PermissionRequested"
+  | "PermissionResolved";
 
 /** Inbound HTTP event payload (`POST /event`). */
 export interface HookEvent {

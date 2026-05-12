@@ -336,4 +336,80 @@ describe("StateMachine", () => {
     clock.advance(60_000);
     // (no exception, machine simply doesn't react)
   });
+
+  // ---------------------------------------------------------------------------
+  // v0.3 — PermissionRequested / PermissionResolved (sticky review)
+  // ---------------------------------------------------------------------------
+  it("PermissionRequested → REVIEW (sticky, no TTL)", () => {
+    m.ingest({ kind: "PermissionRequested", sessionId: "s1" });
+    expect(m.globalState).toBe("review");
+
+    // Even after a long wait it should NOT auto-degrade — review is sticky.
+    clock.advance(60_000);
+    expect(m.globalState).toBe("review");
+  });
+
+  it("PermissionResolved clears REVIEW", () => {
+    m.ingest({ kind: "PermissionRequested", sessionId: "s1" });
+    expect(m.globalState).toBe("review");
+
+    m.ingest({ kind: "PermissionResolved", sessionId: "s1" });
+    // session has no other state, defaults to RUN base after the perm event
+    // arms the silence timer; effectively idle baseState until that timer hits.
+    expect(m.globalState).toBe("idle");
+  });
+
+  it("REVIEW survives a brief FAILED flash (separate slot)", () => {
+    m.ingest({ kind: "PreToolUse", sessionId: "s1" });
+    m.ingest({ kind: "PermissionRequested", sessionId: "s1" });
+    expect(m.globalState).toBe("review"); // review > run
+
+    // A tool fails while perm is still pending — failed wins over review briefly.
+    m.ingest({ kind: "PostToolUse", sessionId: "s1", exitCode: 1 });
+    expect(m.globalState).toBe("failed");
+
+    // Failed degrades after 2s — review must come back, not get lost.
+    clock.advance(2_001);
+    expect(m.globalState).toBe("review");
+  });
+
+  it("REVIEW beats jump / wave / extra1 / extra2", () => {
+    m.ingest({ kind: "PermissionRequested", sessionId: "s_perm" });
+    expect(m.globalState).toBe("review");
+
+    // Another session emits various transient overlays — review should win.
+    m.ingest({ kind: "UserPromptSubmit", sessionId: "s_other" });
+    expect(m.globalState).toBe("review");
+
+    m.ingest({ kind: "MessageComplete", sessionId: "s_other" });
+    expect(m.globalState).toBe("review");
+
+    m.ingest({ kind: "SessionStart", sessionId: "s_boot" });
+    expect(m.globalState).toBe("review");
+  });
+
+  it("SessionEnd clears any sticky review on that session", () => {
+    m.ingest({ kind: "PermissionRequested", sessionId: "s1" });
+    expect(m.globalState).toBe("review");
+
+    m.ingest({ kind: "SessionEnd", sessionId: "s1" });
+    // SessionEnd's own extra2 overlay takes over.
+    expect(m.globalState).toBe("extra2");
+
+    clock.advance(2_600);
+    expect(m.globalState).toBe("idle");
+  });
+
+  it("multi-session: REVIEW in one + RUN in others → global REVIEW", () => {
+    m.ingest({ kind: "PreToolUse", sessionId: "s_busy_a" });
+    m.ingest({ kind: "PreToolUse", sessionId: "s_busy_b" });
+    expect(m.globalState).toBe("run");
+
+    m.ingest({ kind: "PermissionRequested", sessionId: "s_perm" });
+    expect(m.globalState).toBe("review");
+
+    m.ingest({ kind: "PermissionResolved", sessionId: "s_perm" });
+    // Other sessions still running.
+    expect(m.globalState).toBe("run");
+  });
 });
