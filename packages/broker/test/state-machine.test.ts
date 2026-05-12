@@ -186,7 +186,7 @@ describe("StateMachine", () => {
   // ---------------------------------------------------------------------------
   // v0.2 — UserPromptSubmit → JUMP
   // ---------------------------------------------------------------------------
-  it("UserPromptSubmit → JUMP for 1.5s, then degrades to idle", () => {
+  it("UserPromptSubmit → JUMP for 1.5s, then degrades to RUN (thinking baseline)", () => {
     m.ingest({ kind: "UserPromptSubmit", sessionId: "s1" });
     expect(m.globalState).toBe("jump");
 
@@ -194,7 +194,10 @@ describe("StateMachine", () => {
     expect(m.globalState).toBe("jump");
 
     clock.advance(2);
-    expect(m.globalState).toBe("idle");
+    // v0.3.1: UserPromptSubmit sets baseState=run so the pet keeps animating
+    // during the agent's thinking phase (no PreToolUse yet). MessageComplete
+    // resets it to idle.
+    expect(m.globalState).toBe("run");
   });
 
   it("JUMP overlay beats RUN in aggregation", () => {
@@ -411,5 +414,39 @@ describe("StateMachine", () => {
     m.ingest({ kind: "PermissionResolved", sessionId: "s_perm" });
     // Other sessions still running.
     expect(m.globalState).toBe("run");
+  });
+
+  // ---------------------------------------------------------------------------
+  // v0.3.1 — SessionEnd defers EXTRA2 until WAVE finishes
+  // ---------------------------------------------------------------------------
+  it("v0.3.1 — SessionEnd defers EXTRA2 until WAVE overlay finishes (so 'done!' bubble is actually visible)", () => {
+    m.ingest({ kind: "MessageComplete", sessionId: "s1" });
+    expect(m.globalState).toBe("wave");
+
+    // SessionEnd arrives 500ms into the wave (waveDurationMs=1000).
+    clock.advance(500);
+    m.ingest({ kind: "SessionEnd", sessionId: "s1" });
+    // Wave should STILL be visible — extra2 deferred for waveDurationMs more.
+    expect(m.globalState).toBe("wave");
+
+    // SessionEnd's deferred extra2 fires waveDurationMs (1000ms) after SessionEnd.
+    clock.advance(1_001);
+    expect(m.globalState).toBe("extra2");
+
+    // After extra2 finishes (bootDurationMs=2500), session is dropped.
+    clock.advance(2_600);
+    expect(m.globalState).toBe("idle");
+    expect(m.snapshotSessions().some((s) => s.sessionId === "s1")).toBe(false);
+  });
+
+  it("v0.3.1 — SessionEnd without prior WAVE goes straight to EXTRA2 (no regression)", () => {
+    m.ingest({ kind: "PreToolUse", sessionId: "s1" });
+    expect(m.globalState).toBe("run");
+
+    m.ingest({ kind: "SessionEnd", sessionId: "s1" });
+    expect(m.globalState).toBe("extra2");
+
+    clock.advance(2_600);
+    expect(m.globalState).toBe("idle");
   });
 });

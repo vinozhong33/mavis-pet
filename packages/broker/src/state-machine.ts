@@ -238,9 +238,11 @@ export class StateMachine {
 
   private applyUserPromptSubmit(s: SessionRecord): void {
     // User just sent a new message → short JUMP of joy.
-    // Base resets to idle (agent hasn't tooled yet); next PreToolUse will
-    // flip back to RUNNING and the JUMP timer will already have degraded.
-    s.baseState = "idle";
+    // baseState becomes RUN so the pet keeps animating during the agent's
+    // thinking phase (LLM call, before any tool is invoked). MessageComplete
+    // resets it back to idle. This eliminates the dead "static idle" frame
+    // that v0.3 showed during long thinking spans.
+    s.baseState = "run";
     this.setOverlay(s, "jump", this.jumpDurationMs);
   }
 
@@ -251,19 +253,44 @@ export class StateMachine {
   }
 
   private applySessionEnd(s: SessionRecord, now: number): void {
-    // EXTRA2 overlay, then the session is dropped after the overlay degrades.
+    // mavis daemon often emits MessageComplete and SessionEnd back-to-back
+    // (within ~1s after the agent's reply). If we set extra2 overlay
+    // immediately we'd clobber the wave overlay before the user sees the
+    // "done!" bubble. Defer extra2 until any active wave overlay finishes.
+    const isWaveActive = s.overlay === "wave";
+    if (isWaveActive && s.overlayTimer) {
+      // Let the existing wave timer run; chain extra2 onto it.
+      const waveTimer = s.overlayTimer;
+      this.clock.clearTimeout(waveTimer);
+      // Give wave the full waveDurationMs so it's actually visible.
+      s.overlayTimer = this.clock.setTimeout(() => {
+        // Now switch to extra2.
+        s.baseState = "idle";
+        s.reviewActive = false;
+        s.overlay = "extra2";
+        s.overlayTimer = this.clock.setTimeout(() => {
+          this.sessions.delete(s.sessionId);
+          this.recompute(this.clock.now());
+        }, this.bootDurationMs);
+        this.recompute(this.clock.now());
+      }, this.waveDurationMs);
+      // Keep the idleTimer cleared since we're guaranteed to forget this session.
+      if (s.idleTimer) this.clock.clearTimeout(s.idleTimer);
+      s.idleTimer = null;
+      void now;
+      return;
+    }
+    // No wave to preserve — go straight to extra2.
     if (s.overlayTimer) this.clock.clearTimeout(s.overlayTimer);
     if (s.idleTimer) this.clock.clearTimeout(s.idleTimer);
     s.baseState = "idle";
-    // Session is leaving — drop any sticky review signal too.
     s.reviewActive = false;
     s.overlay = "extra2";
     s.overlayTimer = this.clock.setTimeout(() => {
-      // Drop the session record entirely; SessionEnd is terminal.
       this.sessions.delete(s.sessionId);
       this.recompute(this.clock.now());
     }, this.bootDurationMs);
-    s.idleTimer = null; // no idle timer for a session that's about to be forgotten
+    s.idleTimer = null;
     void now;
   }
 

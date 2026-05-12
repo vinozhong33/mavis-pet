@@ -42,8 +42,10 @@ export interface BrokerOptions {
   /** Default time-to-live (ms) for bubbles. Defaults to 2500. */
   bubbleTtlMs?: number;
   /**
-   * Disable the mavis daemon permission poller (default: enabled).
-   * Tests typically want to disable this so they don't try to fetch a daemon.
+   * Disable the mavis daemon permission poller (default: **disabled** as of
+   * v0.3.1 — the daemon's `/api/permission/requests` endpoint disappeared
+   * after a daemon refactor and we'd just spam the log with 404s. Set to
+   * `false` explicitly when the endpoint comes back, or override `daemonUrl`).
    */
   disablePermPoller?: boolean;
   /** Override daemon URL for the perm poller. Default http://127.0.0.1:15321. */
@@ -163,9 +165,12 @@ export async function startBroker(opts: BrokerOptions = {}): Promise<BrokerHandl
     }
   });
 
-  // Start the mavis daemon perm poller (unless disabled, e.g. in tests).
+  // Start the mavis daemon perm poller. Default DISABLED in v0.3.1 because
+  // the daemon's `/api/permission/requests` endpoint vanished after a daemon
+  // refactor (returns 404). Pass `disablePermPoller: false` explicitly to
+  // re-enable when the endpoint comes back (or override `daemonUrl`).
   let permPoller: PermPoller | null = null;
-  if (!opts.disablePermPoller) {
+  if (opts.disablePermPoller === false) {
     permPoller = startPermPoller({
       clock,
       machine,
