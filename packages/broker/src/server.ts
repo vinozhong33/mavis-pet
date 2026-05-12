@@ -19,6 +19,20 @@ import type { HookEvent, PetState } from "./types.js";
 export const DEFAULT_HOST = "127.0.0.1";
 export const DEFAULT_PORT = 7857;
 
+/**
+ * v0.4 task-card config — populates the bubble card the floater renders.
+ *
+ * - `title` (required) — bold one-line task title (ellipsised in the card).
+ * - `subtitle` (optional) — light two-line description (ellipsised at line 2).
+ * - `loading` (optional) — when true, floater shows a spinner in the card's
+ *   top-right; means "agent is working / waiting on something".
+ */
+export interface CardConfig {
+  title: string;
+  subtitle?: string;
+  loading?: boolean;
+}
+
 export interface BrokerOptions {
   host?: string;
   port?: number;
@@ -37,8 +51,23 @@ export interface BrokerOptions {
   /**
    * Override / extend default speech bubbles. Keys are PetState; values are
    * either a short string or `null` to suppress the bubble for that state.
+   *
+   * Legacy compact-pill mode. New code should prefer {@link cards}; this is
+   * kept for back-compat and one-liner overrides.
    */
   bubbles?: Partial<Record<PetState, string | null>>;
+  /**
+   * v0.4 task-card config per state. Each entry can supply title (bold one
+   * liner), subtitle (light two-line description), and loading (spinner).
+   * Set entry to `null` to suppress the card for that state. When a card is
+   * present for a state, it takes precedence over {@link bubbles}.
+   *
+   * Default cards are defined for transient overlay states (jump / wave /
+   * extra1 / extra2 / failed / review). Idle and run intentionally have no
+   * default card — they need real session data (title, latest message)
+   * supplied by the SSE module in v0.4.1+.
+   */
+  cards?: Partial<Record<PetState, CardConfig | null>>;
   /** Default time-to-live (ms) for bubbles. Defaults to 2500. */
   bubbleTtlMs?: number;
   /**
@@ -70,7 +99,9 @@ export interface BrokerHandle {
 }
 
 /**
- * Default speech-bubble copy per state. Override via {@link BrokerOptions.bubbles}.
+ * Default speech-bubble copy per state (legacy compact pill).
+ * Used as fallback when no v0.4 card is configured for the state.
+ * Override via {@link BrokerOptions.bubbles}.
  */
 const DEFAULT_BUBBLES: Record<PetState, string | null> = {
   failed: "oops",
@@ -81,6 +112,26 @@ const DEFAULT_BUBBLES: Record<PetState, string | null> = {
   wave: "done!",
   run: null,
   idle: null,
+};
+
+/**
+ * v0.4 task-card config (per state). Stub copy until the SSE module in
+ * v0.4.1+ supplies real session title + latest assistant message.
+ *
+ * Idle and run intentionally remain `null` — they want real data, not
+ * stub text. Until the SSE pipeline lands, idle/run keep going through
+ * the legacy bubble path (which is also null for those two states, so
+ * the floater shows nothing — same as v0.3).
+ */
+const DEFAULT_CARDS: Record<PetState, CardConfig | null> = {
+  failed:  { title: "Tool failed", subtitle: "检查输出 / 查日志", loading: false },
+  review:  { title: "Permission needed", subtitle: "等你 allow", loading: true },
+  jump:    { title: "Got it", subtitle: "开始处理...", loading: true },
+  extra1:  { title: "Hello", subtitle: "新会话开始", loading: false },
+  extra2:  { title: "See ya", subtitle: "会话结束", loading: false },
+  wave:    { title: "Done", subtitle: "完成 ✓", loading: false },
+  run:     null,
+  idle:    null,
 };
 
 export async function startBroker(opts: BrokerOptions = {}): Promise<BrokerHandle> {
@@ -106,6 +157,10 @@ export async function startBroker(opts: BrokerOptions = {}): Promise<BrokerHandl
     ...DEFAULT_BUBBLES,
     ...(opts.bubbles ?? {}),
   };
+  const cards: Record<PetState, CardConfig | null> = {
+    ...DEFAULT_CARDS,
+    ...(opts.cards ?? {}),
+  };
   const bubbleTtlMs = opts.bubbleTtlMs ?? 2_500;
 
   const hub = new WsHub({
@@ -118,20 +173,30 @@ export async function startBroker(opts: BrokerOptions = {}): Promise<BrokerHandl
     getCurrentPet: () => petRef.slug,
   });
 
-  // Wire state changes → broadcast (with optional speech bubble).
-  // REVIEW is a sticky state — its bubble should NOT auto-dismiss while
-  // it's active, so emit it without TTL (floater treats undefined ttl as
-  // "stay until next state").
+  // Wire state changes → broadcast.
+  // Routing priority:
+  //   1. cards[state] present → emit v0.4 task-card (title + subtitle + loading)
+  //   2. else bubbles[state]  → emit legacy compact pill
+  //   3. else                  → plain state push (no bubble)
+  // Sticky states (review) skip auto-dismiss TTL — bubble stays until next push.
   machine.onChange((state, ts) => {
+    const card = cards[state];
+    if (card) {
+      const sticky = state === "review";
+      hub.broadcastState(state, ts, {
+        title: card.title,
+        subtitle: card.subtitle,
+        loading: card.loading,
+        bubbleTtlMs: sticky ? undefined : bubbleTtlMs,
+      });
+      return;
+    }
     const text = bubbles[state];
     if (!text) {
       hub.broadcastState(state, ts);
       return;
     }
     if (state === "review") {
-      // Sticky bubble — no TTL. Floater will keep showing until the next
-      // state push (typically Permission Resolved → state changes to whatever
-      // comes next, which carries its own bubble or no bubble).
       hub.broadcastState(state, ts, { bubble: text });
     } else {
       hub.broadcastState(state, ts, { bubble: text, bubbleTtlMs });

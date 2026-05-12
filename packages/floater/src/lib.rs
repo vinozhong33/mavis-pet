@@ -49,13 +49,44 @@ fn elevate_for_fullscreen(window: &tauri::WebviewWindow) -> Result<(), String> {
                 | NSWindowCollectionBehavior::NSWindowCollectionBehaviorIgnoresCycle;
         ns_window.setCollectionBehavior_(behavior);
 
-        // NSPopUpMenuWindowLevel = 101 — above the menu bar (NSMainMenuWindowLevel = 24)
-        // and above other apps' fullscreen content.  NSScreenSaverWindowLevel (1000)
-        // would also work but is overkill and steals events from native screen savers.
-        let _: () = msg_send![ns_window, setLevel: 101_i64];
+        // NSPopUpMenuWindowLevel = 101 was the historical recommendation but
+        // **does not survive other apps' fullscreen Spaces on macOS 26+** —
+        // empirically the system's fullscreen overlay sits above level 101.
+        // NSStatusWindowLevel = 25 is also too low. Bump to
+        // NSScreenSaverWindowLevel = 1000, which is documented as "above
+        // everything user content" and reliably beats fullscreen apps on
+        // macOS 14-26. Slight risk of stealing focus from native screen
+        // savers; we accept it for a desktop pet floater.
+        let _: () = msg_send![ns_window, setLevel: 1000_i64];
+        // Also bump again with print so we can verify in stderr later if needed.
+        eprintln!("[mavis-pet-floater] elevated: collectionBehavior set, level=1000");
     }
     Ok(())
 }
+
+/// Set NSApplication activation policy to **Accessory** (background app).
+/// Required so this binary's NSWindow can actually ride above other apps'
+/// fullscreen Spaces — `regular` apps are subject to macOS Space
+/// restrictions and `set_visible_on_all_workspaces` / collectionBehavior
+/// flags get silently ignored. `Accessory` apps:
+///   - Don't show in the Dock or app switcher
+///   - Can't become the active app (no focus stealing)
+///   - But CAN render NSWindows above other apps' fullscreen Spaces
+/// This is the standard pattern for macOS desktop widgets / menu-bar tools.
+#[cfg(target_os = "macos")]
+fn set_accessory_activation_policy() {
+    use cocoa::appkit::{NSApp, NSApplication, NSApplicationActivationPolicy};
+    unsafe {
+        let app = NSApp();
+        app.setActivationPolicy_(
+            NSApplicationActivationPolicy::NSApplicationActivationPolicyAccessory,
+        );
+        eprintln!("[mavis-pet-floater] NSApplication activationPolicy = Accessory");
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn set_accessory_activation_policy() {}
 
 #[cfg(not(target_os = "macos"))]
 fn elevate_for_fullscreen(_window: &tauri::WebviewWindow) -> Result<(), String> {
@@ -262,12 +293,45 @@ pub fn run() {
         .setup(|app| {
             // Touch the path to surface "no home dir" failures early in stderr.
             let _ = config_path();
+            // macOS: switch to Accessory app type FIRST so subsequent NSWindow
+            // configuration (collectionBehavior, level, set_visible_on_all_workspaces)
+            // can actually take effect. As a regular app these would be silently
+            // limited by the system.
+            set_accessory_activation_policy();
             // Elevate window so it stays visible above other apps' fullscreen Spaces.
+            //
+            // v0.4.x — Tauri v2 init re-applies window properties AFTER our
+            // setup hook (specifically `alwaysOnTop=true` snaps the NSWindow
+            // level back to NSFloatingWindowLevel=3, BELOW other apps'
+            // fullscreen content at level=NSMainMenuWindowLevel-ish).
+            // Workaround: call elevate three times — once now (no harm if
+            // overridden), once after a 300ms delay (post-Tauri-init), and
+            // once every 3s as a watchdog (re-elevates after macOS Space
+            // changes / window state transitions that also reset level).
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.set_visible_on_all_workspaces(true);
                 if let Err(e) = elevate_for_fullscreen(&window) {
-                    eprintln!("[mavis-pet-floater] elevate_for_fullscreen failed: {e}");
+                    eprintln!("[mavis-pet-floater] elevate setup failed: {e}");
                 }
+
+                // Delayed re-apply (Tauri post-init) + watchdog loop.
+                // Use std::thread (not tokio — not in deps) and call into
+                // the main thread isn't required because elevate just runs
+                // Cocoa msg_send, which is thread-safe for these operations.
+                let w_clone = window.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    if let Err(e) = elevate_for_fullscreen(&w_clone) {
+                        eprintln!("[mavis-pet-floater] elevate post-init failed: {e}");
+                    }
+                    // Watchdog: re-elevate every 3s. Cheap (one Cocoa call) and
+                    // survives Space changes / fullscreen toggles that may reset
+                    // window level back to alwaysOnTop default.
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_secs(3));
+                        let _ = elevate_for_fullscreen(&w_clone);
+                    }
+                });
             }
             Ok(())
         })

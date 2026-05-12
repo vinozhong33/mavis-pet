@@ -69,15 +69,29 @@ export interface SessionStatus {
 /**
  * Outbound WebSocket message: state push.
  *
- * Optional `bubble` field carries a short speech-bubble string the floater
- * should render above the pet. `bubbleTtlMs` controls auto-dismiss
- * (defaults to 2500ms client-side if absent).
+ * v0.4 task-card protocol — three optional UI hints, all backwards-compatible:
+ *  - `title`     — bold one-line task title shown in the bubble card.
+ *  - `subtitle`  — small two-line ellipsised description below the title.
+ *  - `loading`   — when true, floater renders a spinner in the card's top-right.
+ *
+ * If `title` is set the floater renders the modern white rounded card; if only
+ * `bubble` is set it falls back to the legacy compact pill (used for older
+ * clients or simple one-liner notifications). `bubbleTtlMs` is shared by both
+ * — defaults to 2500ms client-side; pass undefined for sticky (no auto-hide).
  */
 export interface WsStateMessage {
   type: "state";
   state: PetState;
   ts: number;
+  /** Legacy compact pill text (back-compat). Prefer `title` for new code. */
   bubble?: string;
+  /** v0.4 task-card title (bold, one line, ellipsised). */
+  title?: string;
+  /** v0.4 task-card subtitle (light, two lines, ellipsised). */
+  subtitle?: string;
+  /** v0.4 — show spinner in card top-right (means "agent is working/waiting"). */
+  loading?: boolean;
+  /** Auto-dismiss ms; undefined = sticky until next state push. */
   bubbleTtlMs?: number;
 }
 

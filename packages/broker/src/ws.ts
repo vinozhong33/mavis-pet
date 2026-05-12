@@ -62,16 +62,27 @@ export class WsHub implements Broadcaster {
   }
 
   /**
-   * Broadcast a state change. Optional bubble carries a short speech-bubble
-   * string the floater should render; bubbleTtlMs controls auto-dismiss.
+   * Broadcast a state change. Optional fields:
+   *  - bubble                — legacy compact pill text
+   *  - title/subtitle/loading— v0.4 task-card fields
+   *  - bubbleTtlMs           — shared by both; undefined = sticky
    */
   broadcastState(
     state: PetState,
     ts: number,
-    opts?: { bubble?: string; bubbleTtlMs?: number },
+    opts?: {
+      bubble?: string;
+      title?: string;
+      subtitle?: string;
+      loading?: boolean;
+      bubbleTtlMs?: number;
+    },
   ): void {
     const msg: WsOutMessage = { type: "state", state, ts };
     if (opts?.bubble) msg.bubble = opts.bubble;
+    if (opts?.title) msg.title = opts.title;
+    if (opts?.subtitle) msg.subtitle = opts.subtitle;
+    if (typeof opts?.loading === "boolean") msg.loading = opts.loading;
     if (typeof opts?.bubbleTtlMs === "number") msg.bubbleTtlMs = opts.bubbleTtlMs;
     this.broadcast(msg);
   }

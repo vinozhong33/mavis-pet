@@ -379,4 +379,60 @@ describe("broker HTTP + WS integration", () => {
     }
     expect(threw).toBe(true);
   });
+
+  // v0.4 — task-card protocol smoke tests. Verifies:
+  //  - Transient overlay states (failed, jump, wave, extra1, extra2) carry
+  //    title + subtitle + (sometimes) loading on the WS message.
+  //  - Sticky review state carries loading=true and NO bubbleTtlMs (sticky).
+  //  - Idle/run still emit bare {type, state, ts} (no card; need real session
+  //    data from SSE in v0.4.1+).
+  it("v0.4 — MessageComplete pushes WAVE card with title/subtitle", async () => {
+    const c = await connectWs();
+    await c.waitFor((m) => m.type === "state" && m.state === "idle");
+
+    await postEvent({ kind: "MessageComplete", sessionId: "s1" });
+    const wave = await c.waitFor((m) => m.type === "state" && m.state === "wave");
+
+    expect(wave).toMatchObject({
+      type: "state",
+      state: "wave",
+      title: "Done",
+      subtitle: "完成 ✓",
+      loading: false,
+    });
+    // Wave is transient — must carry a TTL so floater auto-dismisses.
+    expect((wave as { bubbleTtlMs?: number }).bubbleTtlMs).toBeGreaterThan(0);
+    await c.close();
+  });
+
+  it("v0.4 — PermissionRequested pushes REVIEW card with loading=true and NO TTL (sticky)", async () => {
+    const c = await connectWs();
+    await c.waitFor((m) => m.type === "state" && m.state === "idle");
+
+    await postEvent({ kind: "PermissionRequested", sessionId: "s1" });
+    const review = await c.waitFor((m) => m.type === "state" && m.state === "review");
+
+    expect(review).toMatchObject({
+      type: "state",
+      state: "review",
+      title: "Permission needed",
+      subtitle: "等你 allow",
+      loading: true,
+    });
+    // Sticky — must NOT carry a TTL (undefined or absent).
+    expect((review as { bubbleTtlMs?: number }).bubbleTtlMs).toBeUndefined();
+    await c.close();
+  });
+
+  it("v0.4 — RUN state carries no card (waits for v0.4.1 SSE session data)", async () => {
+    const c = await connectWs();
+    await c.waitFor((m) => m.type === "state" && m.state === "idle");
+
+    await postEvent({ kind: "PreToolUse", sessionId: "s1" });
+    const run = await c.waitFor((m) => m.type === "state" && m.state === "run");
+
+    // Strict equality — no extra title/subtitle/loading/bubble fields.
+    expect(run).toEqual({ type: "state", state: "run", ts: expect.any(Number) });
+    await c.close();
+  });
 });
