@@ -25,12 +25,19 @@ serde_json = "1"
 base64 = "0.22"
 dirs = "5"
 
-# macOS native APIs to lift the floater above other apps' fullscreen Spaces
-# (Tauri's set_visible_on_all_workspaces only flips CanJoinAllSpaces; we also
-# need FullScreenAuxiliary + a window level above the menu bar).
+# macOS native APIs to lift the floater above other apps' fullscreen Spaces.
+# v0.4.1 — switched primary mechanism from raw cocoa NSWindow tweaks to
+# tauri-nspanel: macOS 26 stopped honoring NSWindowCollectionBehaviorFullScreenAuxiliary
+# on plain NSWindow subclasses; only NSPanel subclasses survive fullscreen
+# transitions now (verified by BongoCat 20.8k⭐ desktop pet on macOS 26).
+# tauri-nspanel uses object_setClass to swizzle Tauri's default NSWindow
+# into an NSPanel subclass with NonactivatingPanel mask, which is the
+# only macOS-26-compatible path. cocoa/objc kept for the activationPolicy
+# Accessory call; ManagerExt + WebviewWindowExt drive the panel.
 [target.'cfg(target_os = "macos")'.dependencies]
 cocoa = "0.26"
 objc = "0.2"
+tauri-nspanel = { git = "https://github.com/ahkohd/tauri-nspanel", branch = "v2.1" }
 
 [profile.release]
 panic = "abort"

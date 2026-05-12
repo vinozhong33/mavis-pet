@@ -25,54 +25,91 @@ use std::path::{Path, PathBuf};
 use tauri::{Emitter, Manager};
 
 // ---- macOS: lift floater above fullscreen Spaces & menu bar ---------------
+//
+// v0.4.1 — On macOS 26 plain NSWindow can NOT be made to ride above other
+// apps' fullscreen Spaces, no matter what NSWindowCollectionBehavior flags
+// or NSWindowLevel you set. macOS 26 only honors FullScreenAuxiliary on
+// NSPanel subclasses. We use `tauri-nspanel` (BongoCat 20.8k⭐ same
+// use-case dependency) to swizzle Tauri's default NSWindow into an
+// NSPanel subclass with NonactivatingPanel mask, which is the only
+// macOS-26-compatible path. Setting setLevel to anything > NSDockWindowLevel
+// (=20) actually *triggers* fullscreen lockdown and blocks IME, so we
+// stay at PanelLevel::Dock.
 
 #[cfg(target_os = "macos")]
-fn elevate_for_fullscreen(window: &tauri::WebviewWindow) -> Result<(), String> {
-    use cocoa::appkit::{NSWindow, NSWindowCollectionBehavior};
-    use cocoa::base::id;
-    use objc::{msg_send, sel, sel_impl};
+use tauri_nspanel::{
+    tauri_panel, CollectionBehavior, PanelLevel, StyleMask,
+    WebviewWindowExt as _,
+};
 
-    let ns_window = window
-        .ns_window()
-        .map_err(|e| format!("ns_window: {e}"))? as id;
+#[cfg(target_os = "macos")]
+tauri_panel! {
+    panel!(PetPanel {
+        config: {
+            // Desktop pet — never wants keyboard focus (would steal IME).
+            can_become_key_window: false,
+            can_become_main_window: false,
+            is_floating_panel: true,
+        }
+    })
+}
 
-    unsafe {
-        // Combine flags so the window:
-        //   - rides on top of every Space, including other apps' fullscreen Spaces
-        //   - is treated as an auxiliary panel (not promoted as a real fullscreen target)
-        //   - stays put when Spaces are switched
-        //   - skips Cmd-Tab and window cycling
-        let behavior: NSWindowCollectionBehavior =
-            NSWindowCollectionBehavior::NSWindowCollectionBehaviorCanJoinAllSpaces
-                | NSWindowCollectionBehavior::NSWindowCollectionBehaviorFullScreenAuxiliary
-                | NSWindowCollectionBehavior::NSWindowCollectionBehaviorStationary
-                | NSWindowCollectionBehavior::NSWindowCollectionBehaviorIgnoresCycle;
-        ns_window.setCollectionBehavior_(behavior);
+/// Convert Tauri's default NSWindow into an NSPanel via tauri-nspanel,
+/// then apply the macOS-26-compatible visibility flags. Replaces the
+/// pre-v0.4.1 raw cocoa setCollectionBehavior + setLevel approach
+/// (which silently no-ops on macOS 26).
+#[cfg(target_os = "macos")]
+fn install_pet_panel(window: &tauri::WebviewWindow) -> Result<(), String> {
+    let panel = window
+        .to_panel::<PetPanel>()
+        .map_err(|e| format!("to_panel: {e:?}"))?;
 
-        // NSPopUpMenuWindowLevel = 101 was the historical recommendation but
-        // **does not survive other apps' fullscreen Spaces on macOS 26+** —
-        // empirically the system's fullscreen overlay sits above level 101.
-        // NSStatusWindowLevel = 25 is also too low. Bump to
-        // NSScreenSaverWindowLevel = 1000, which is documented as "above
-        // everything user content" and reliably beats fullscreen apps on
-        // macOS 14-26. Slight risk of stealing focus from native screen
-        // savers; we accept it for a desktop pet floater.
-        let _: () = msg_send![ns_window, setLevel: 1000_i64];
-        // Also bump again with print so we can verify in stderr later if needed.
-        eprintln!("[mavis-pet-floater] elevated: collectionBehavior set, level=1000");
-    }
+    // Dock level (=20). NOT NSScreenSaverWindowLevel (1000) — high level
+    // triggers macOS 26 fullscreen lockdown and blocks IME (verified by
+    // tauri-nspanel issue #104).
+    panel.set_level(PanelLevel::Dock.value());
+
+    // NonactivatingPanel mask — required so the panel does NOT become
+    // active app on click, AND is what makes macOS 26 honor the
+    // FullScreenAuxiliary collection behavior.
+    panel.set_style_mask(StyleMask::empty().nonactivating_panel().into());
+
+    // Now collection behavior flags actually take effect (they didn't on
+    // plain NSWindow under macOS 26):
+    //   - can_join_all_spaces: appear on every Space, not just current
+    //   - full_screen_auxiliary: ride on top of other apps' fullscreen
+    //   - stationary: don't move with Space-switch animation
+    //
+    // NOTE: tried `move_to_active_space()` in place of `stationary()` to
+    // try to eliminate the small flicker on Space transitions — broke the
+    // "follow into fullscreen" behavior entirely. The two flags are
+    // mutually exclusive at the macOS level: move_to_active_space says
+    // "I live in one Space at a time and follow you", which conflicts
+    // with can_join_all_spaces ("I exist in every Space simultaneously").
+    // Accepting the small flicker as a known minor visual cost — the
+    // primary fix (visible above fullscreen) is intact.
+    panel.set_collection_behavior(
+        CollectionBehavior::new()
+            .can_join_all_spaces()
+            .full_screen_auxiliary()
+            .stationary()
+            .into(),
+    );
+
+    panel.show();
+    eprintln!("[mavis-pet-floater] PetPanel installed (NSPanel + nonactivating + FullScreenAuxiliary, level=Dock)");
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn install_pet_panel(_window: &tauri::WebviewWindow) -> Result<(), String> {
     Ok(())
 }
 
 /// Set NSApplication activation policy to **Accessory** (background app).
-/// Required so this binary's NSWindow can actually ride above other apps'
-/// fullscreen Spaces — `regular` apps are subject to macOS Space
-/// restrictions and `set_visible_on_all_workspaces` / collectionBehavior
-/// flags get silently ignored. `Accessory` apps:
-///   - Don't show in the Dock or app switcher
-///   - Can't become the active app (no focus stealing)
-///   - But CAN render NSWindows above other apps' fullscreen Spaces
-/// This is the standard pattern for macOS desktop widgets / menu-bar tools.
+/// Required so this binary doesn't show up in the Dock and doesn't steal
+/// focus. Combined with the NSPanel + nonactivating_panel mask above,
+/// this gives the standard macOS desktop-widget profile.
 #[cfg(target_os = "macos")]
 fn set_accessory_activation_policy() {
     use cocoa::appkit::{NSApp, NSApplication, NSApplicationActivationPolicy};
@@ -289,49 +326,35 @@ fn reload_pet(app: tauri::AppHandle) -> Result<(), String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // tauri-nspanel plugin MUST be registered BEFORE any setup hook calls
+        // `to_panel()` — it installs the PanelManager state container that
+        // `to_panel` looks up. If we register after setup, `to_panel` panics
+        // with "PanelManager not found in app state".
+        .plugin(tauri_nspanel::init())
         .invoke_handler(tauri::generate_handler![get_pet, list_pets, reload_pet])
         .setup(|app| {
             // Touch the path to surface "no home dir" failures early in stderr.
             let _ = config_path();
-            // macOS: switch to Accessory app type FIRST so subsequent NSWindow
-            // configuration (collectionBehavior, level, set_visible_on_all_workspaces)
-            // can actually take effect. As a regular app these would be silently
-            // limited by the system.
+            // Switch to Accessory app type (no Dock entry, no focus stealing).
+            // Combined with NSPanel + nonactivating_panel mask below, this is
+            // the canonical macOS desktop-widget profile.
             set_accessory_activation_policy();
-            // Elevate window so it stays visible above other apps' fullscreen Spaces.
-            //
-            // v0.4.x — Tauri v2 init re-applies window properties AFTER our
-            // setup hook (specifically `alwaysOnTop=true` snaps the NSWindow
-            // level back to NSFloatingWindowLevel=3, BELOW other apps'
-            // fullscreen content at level=NSMainMenuWindowLevel-ish).
-            // Workaround: call elevate three times — once now (no harm if
-            // overridden), once after a 300ms delay (post-Tauri-init), and
-            // once every 3s as a watchdog (re-elevates after macOS Space
-            // changes / window state transitions that also reset level).
+
+            // v0.4.1 — swap Tauri's default NSWindow for an NSPanel via
+            // tauri-nspanel. macOS 26 stopped honoring FullScreenAuxiliary on
+            // plain NSWindow; only NSPanel subclasses are allowed to ride
+            // above other apps' fullscreen Spaces. set_visible_on_all_workspaces
+            // remains useful as a hint but no longer sufficient on its own.
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.set_visible_on_all_workspaces(true);
-                if let Err(e) = elevate_for_fullscreen(&window) {
-                    eprintln!("[mavis-pet-floater] elevate setup failed: {e}");
-                }
 
-                // Delayed re-apply (Tauri post-init) + watchdog loop.
-                // Use std::thread (not tokio — not in deps) and call into
-                // the main thread isn't required because elevate just runs
-                // Cocoa msg_send, which is thread-safe for these operations.
-                let w_clone = window.clone();
-                std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_millis(300));
-                    if let Err(e) = elevate_for_fullscreen(&w_clone) {
-                        eprintln!("[mavis-pet-floater] elevate post-init failed: {e}");
-                    }
-                    // Watchdog: re-elevate every 3s. Cheap (one Cocoa call) and
-                    // survives Space changes / fullscreen toggles that may reset
-                    // window level back to alwaysOnTop default.
-                    loop {
-                        std::thread::sleep(std::time::Duration::from_secs(3));
-                        let _ = elevate_for_fullscreen(&w_clone);
-                    }
-                });
+                #[cfg(target_os = "macos")]
+                if let Err(e) = install_pet_panel(&window) {
+                    eprintln!("[mavis-pet-floater] panel install failed: {e}");
+                }
+                // No watchdog — NSPanel's collectionBehavior + level survive
+                // fullscreen / Space transitions natively, unlike the v0.4.0
+                // raw-NSWindow approach.
             }
             Ok(())
         })
