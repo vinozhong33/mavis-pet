@@ -245,18 +245,6 @@ mavis-pet/
 
 ---
 
-## 故障排查 5 条
-
-| 现象 | 处理 |
-|---|---|
-| 屏幕看不到宠物 | `mavis-pet status` 看 floater 是否 running;running 但看不到可能在屏幕角外,`stop && start` |
-| 宠物在屏幕但不切动画 | `curl -XPOST http://127.0.0.1:7857/event -d '{"sessionId":"t","kind":"PreToolUse"}'`;state 不变 → broker 出问题(`cd packages/broker && npm test`);state 变了但宠物不动 → wsClients=0 重启 floater |
-| 跟 mavis 聊天宠物没反应 | `mavis hook list \| grep mavis-pet`,应该 6 条;少了 → `mavis-pet hook install` |
-| broker 起不来 | 7857 占用 → `MAVIS_PET_BROKER_PORT=7858 mavis-pet start` |
-| 别的 app 全屏后宠物消失 | v0.2.0 之前的版本会;升级到 v0.2.1+ 自动加了 cocoa cross-fullscreen 修复 |
-
----
-
 ## License
 
 MIT — 见 [LICENSE](./LICENSE)
