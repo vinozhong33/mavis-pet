@@ -118,7 +118,7 @@
       <div class="pet idle" id="pet" data-tauri-drag-region></div>
     </div>
     <script>
-      const STATES = ['idle', 'wave', 'run', 'failed', 'review', 'jump', 'extra1', 'extra2'];
+      const STATES = ['idle', 'wave', 'run', 'jump', 'review', 'failed', 'extra1', 'extra2'];
       const invoke = window.__TAURI__?.core?.invoke ?? window.__TAURI_INTERNALS__?.invoke;
       const listen = window.__TAURI__?.event?.listen;
 
