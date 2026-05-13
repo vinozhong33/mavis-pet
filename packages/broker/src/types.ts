@@ -74,6 +74,12 @@ export interface SessionStatus {
  *  - `subtitle`  — small two-line ellipsised description below the title.
  *  - `loading`   — when true, floater renders a spinner in the card's top-right.
  *
+ * v0.4.2 — `activeSessionCount` drives the collapsed-state badge ("①") on
+ * the floater. 0 = no badge, just the pet sprite alone (idle); >0 =
+ * collapsed badge shows N. The floater also uses this to decide whether
+ * to render the expanded card at all (count == 0 → no card, count > 0 →
+ * card visible if user hasn't collapsed it).
+ *
  * If `title` is set the floater renders the modern white rounded card; if only
  * `bubble` is set it falls back to the legacy compact pill (used for older
  * clients or simple one-liner notifications). `bubbleTtlMs` is shared by both
@@ -93,6 +99,8 @@ export interface WsStateMessage {
   loading?: boolean;
   /** Auto-dismiss ms; undefined = sticky until next state push. */
   bubbleTtlMs?: number;
+  /** v0.4.2 — number of active mavis sessions; drives collapsed-state badge. */
+  activeSessionCount?: number;
 }
 
 /** Outbound WebSocket message: pet (slug) switch. */

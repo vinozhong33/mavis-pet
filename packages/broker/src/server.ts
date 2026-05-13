@@ -179,7 +179,13 @@ export async function startBroker(opts: BrokerOptions = {}): Promise<BrokerHandl
   //   2. else bubbles[state]  → emit legacy compact pill
   //   3. else                  → plain state push (no bubble)
   // Sticky states (review) skip auto-dismiss TTL — bubble stays until next push.
+  //
+  // v0.4.2 — every state push now also carries activeSessionCount derived
+  // from the state machine's per-session map. Floater uses this to drive
+  // the collapsed-state badge ("①") and to decide whether the card
+  // should be visible at all (count==0 → no card).
   machine.onChange((state, ts) => {
+    const activeSessionCount = machine.activeSessionCount();
     const card = cards[state];
     if (card) {
       const sticky = state === "review";
@@ -188,18 +194,19 @@ export async function startBroker(opts: BrokerOptions = {}): Promise<BrokerHandl
         subtitle: card.subtitle,
         loading: card.loading,
         bubbleTtlMs: sticky ? undefined : bubbleTtlMs,
+        activeSessionCount,
       });
       return;
     }
     const text = bubbles[state];
     if (!text) {
-      hub.broadcastState(state, ts);
+      hub.broadcastState(state, ts, { activeSessionCount });
       return;
     }
     if (state === "review") {
-      hub.broadcastState(state, ts, { bubble: text });
+      hub.broadcastState(state, ts, { bubble: text, activeSessionCount });
     } else {
-      hub.broadcastState(state, ts, { bubble: text, bubbleTtlMs });
+      hub.broadcastState(state, ts, { bubble: text, bubbleTtlMs, activeSessionCount });
     }
   });
 

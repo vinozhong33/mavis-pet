@@ -20,43 +20,123 @@
         position: relative;
         width: 100%; height: 100%;
         background: transparent;
-        overflow: hidden;
+        /* IMPORTANT: must be `visible`, not `hidden`. The chevron toggle
+         * sits at top:-6 right:-10 relative to .pet-host (overlapping the
+         * top-right corner of the pet sprite), which means part of it
+         * extends OUTSIDE .pet-host on the top and right. With
+         * overflow:hidden the chevron gets clipped to nothing.
+         * Sprite frame越界 was the original reason this was hidden;
+         * v0.4.1's `steps(5, jump-none)` + `to: -4*W` keeps sprite
+         * background-position within bounds, so we no longer need the
+         * outer clip. */
+        overflow: visible;
+        display: grid;
+        grid-template-rows: auto 1fr;
+        gap: 8px;
+        padding: 4px 8px 8px 8px;
+        box-sizing: border-box;
       }
-      /* Pet anchored bottom-RIGHT; bubble floats top-LEFT. */
+
+      /* ---- v0.4.2 layout: boba TOP-RIGHT, card RIGHT BELOW (replaces v0.4 left/right split) ---- */
+
+      /* Pet container: holds the sprite + the toggle (chevron / badge).
+       * In row 1, right-aligned (justify-self: end).  pet sprite + toggle
+       * are positioned within. */
+      .pet-host {
+        position: relative;
+        justify-self: end;
+        align-self: start;
+        width: auto;
+        height: auto;
+      }
       .pet {
-        position: absolute;
-        right: 8px;
-        bottom: 4px;
+        position: relative;
         background-repeat: no-repeat;
         image-rendering: pixelated;
         will-change: background-position;
         pointer-events: auto;
       }
 
-      /* ---- v0.4 task-card bubble --------------------------------------- */
-      .bubble {
+      /* Toggle handle in pet's top-right corner. Two skins switched by
+       * .collapsed class on .pet-host:
+       *   - collapsed=false  →  small ⌄ chevron (means "click to collapse")
+       *   - collapsed=true   →  pale-blue ① badge (means "N tasks; click to expand")
+       * Hidden entirely when there are no active sessions. */
+      .pet-toggle {
         position: absolute;
-        top: 8px;
-        left: 8px;
-        width: 240px;
-        max-width: calc(100% - 16px);
+        /* Anchor to pet's top-right corner with slight outward offset so
+         * the badge half-overlaps the sprite (visually attached to it
+         * rather than floating loose). Requires .stage to have
+         * overflow:visible (or the negative offsets get clipped). */
+        top: -4px;
+        right: -4px;
+        width: 22px;
+        min-width: 22px;
+        height: 22px;
+        padding: 0;
+        border-radius: 11px;
+        display: none;
+        align-items: center;
+        justify-content: center;
+        font-size: 12px;
+        font-weight: 600;
+        line-height: 1;
+        background: #ffffff;
+        color: #333333;
+        border: none;
+        /* Soft drop on transparent desktop windows: same recipe as the
+         * task card — wide shadow with high alpha (e.g. 0 2px 6px α0.18)
+         * renders as a visible grey halo on the wallpaper. Stay tight,
+         * low-alpha, and use a hairline ring to define the edge. */
+        box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06),
+                    0 2px 6px rgba(0, 0, 0, 0.05),
+                    0 0 0 0.5px rgba(0, 0, 0, 0.08);
+        cursor: pointer;
+        pointer-events: auto;
+        z-index: 10;
+        transition: background 120ms ease-out, transform 120ms ease-out;
+        font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
+      }
+      .pet-toggle:hover { background: #f3f6fb; transform: scale(1.05); }
+      .pet-toggle:active { transform: scale(0.92); }
+      .pet-host.has-tasks .pet-toggle { display: inline-flex; }
+      /* Chevron (expanded state) vs count (collapsed state) — only one
+       * shown at a time, controlled by .pet-host.collapsed class. SVG path
+       * guaranteed to render as a real ∨ shape regardless of system font
+       * (the previous `⌄` U+2304 character fell back to plain "v" letter
+       * in macOS WebView). */
+      .pet-toggle .pet-toggle-chevron { display: block; }
+      .pet-toggle .pet-toggle-count { display: none; font-size: 12px; font-weight: 600; line-height: 1; }
+      .pet-host.collapsed .pet-toggle .pet-toggle-chevron { display: none; }
+      .pet-host.collapsed .pet-toggle .pet-toggle-count { display: inline; }
+      .pet-host.collapsed .pet-toggle {
+        background: #4a90e2;
+        color: #ffffff;
+        box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08),
+                    0 2px 6px rgba(74, 144, 226, 0.18),
+                    0 0 0 0.5px rgba(255, 255, 255, 0.4) inset;
+      }
+      .pet-host.collapsed .pet-toggle:hover { background: #3a7fd0; }
+
+      /* ---- Task card (row 2, naturally below the pet via grid layout) ---- */
+      .bubble {
+        align-self: start;       /* hug top of row 2 — i.e. right under the pet */
         background: #ffffff;
         color: #1a1a1a;
         border: 1px solid rgba(0, 0, 0, 0.08);
         border-radius: 14px;
-        /* Soft drop on transparent desktop windows: a wide ambient shadow
-         * (e.g. 0 4px 18px) renders as a visible grey rectangular halo on
-         * top of the wallpaper because there's no opaque backing to absorb
-         * the gradient. Keep it tight, low-alpha, and short-radius. */
         box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06),
                     0 2px 8px rgba(0, 0, 0, 0.05);
         padding: 8px 10px 10px 10px;
         opacity: 0;
-        transform: translateY(-2px);
+        transform: translateY(2px);
         pointer-events: none;
-        transition: opacity 200ms ease-out, transform 200ms ease-out;
+        transition: opacity 180ms ease-out, transform 180ms ease-out;
+        width: 100%;
+        box-sizing: border-box;
       }
-      .bubble.show { opacity: 1; transform: translateY(0); }
+      .bubble.show { opacity: 1; transform: translateY(0); pointer-events: auto; }
+      .bubble.hidden { display: none !important; }
 
       .bubble-row {
         display: flex;
@@ -94,7 +174,7 @@
         border-top-color: #1a1a1a;
         border-radius: 50%;
         animation: bubble-spin 0.9s linear infinite;
-        opacity: 0;            /* hidden by default; .loading enables */
+        opacity: 0;
         transition: opacity 150ms ease-out;
       }
       .bubble.loading .spinner { opacity: 1; }
@@ -102,64 +182,34 @@
 
       .bubble .subtitle {
         margin-top: 6px;
-        margin-left: 30px;       /* align under title (badge 22 + gap 8) */
+        margin-left: 30px;
         font-size: 12px;
         line-height: 1.35;
         color: #555555;
         font-weight: 400;
         display: -webkit-box;
-        -webkit-line-clamp: 2;   /* clamp to 2 lines */
+        -webkit-line-clamp: 2;
         -webkit-box-orient: vertical;
         overflow: hidden;
         text-overflow: ellipsis;
       }
-      .bubble .subtitle:empty {
-        display: none;
-        margin: 0;
-      }
+      .bubble .subtitle:empty { display: none; margin: 0; }
 
-      /* Compact mode (no subtitle, no spinner) — slimmer card. */
       .bubble.compact {
         padding: 5px 10px 5px 6px;
-        width: auto;
         max-width: 220px;
         border-radius: 999px;
       }
       .bubble.compact .subtitle { display: none; }
-      .bubble.compact .title {
-        font-size: 13px;
-        font-weight: 600;
-      }
+      .bubble.compact .title { font-size: 13px; font-weight: 600; }
 
       @media (prefers-color-scheme: dark) {
-        .bubble {
-          background: #ffffff;   /* keep light on dark wallpapers */
-          color: #1a1a1a;
-        }
+        .bubble { background: #ffffff; color: #1a1a1a; }
       }
 
-      /* ---- pet animations(unchanged from v0.3.3)---------------------- */
-      /* IMPORTANT: petdex sprites are 8 cols × 9 rows but only the first 6
-       * frames per row are animation; cols 7-8 are RESERVED transparent
-       * padding. CSS pattern below uses `steps(N, jump-none)` + `to: -(N-1)*W`
-       * so the keyframe NEVER points at the reserved blank cells, even at
-       * `infinite` loop boundaries (where some webviews briefly snap to
-       * the `to` value before resetting). Going `to: -N*W` would show a
-       * single blank frame on every loop restart. */
-      /* ---- pet animations(unchanged from v0.3.3)---------------------- */
-      /* IMPORTANT — CSS spec: `steps()` first arg MUST be integer literal,
-       * `var()` is rejected at parse time → entire animation-timing-function
-       * becomes invalid → falls back to default `ease` (continuous interpolation)
-       * → background-position slides continuously through reserved blank cells
-       * (col 6,7) on its way to col 5, causing the pet to vanish for fractions
-       * of a second. Hardcoding `steps(5, jump-none)` keeps it actually stepped.
-       *
-       * v0.4 trial — frame_count = 5 (was 6). Boba sprite has variable
-       * per-row frame counts; row 3 (jump) is empirically only 5 frames so
-       * frame_count=6 displayed a blank frame mid-animation. 5 is the
-       * least-common denominator that keeps every row's animation inside
-       * its actual sprite cells. Animations on 6+-frame rows lose the
-       * 6th frame which is acceptable visual loss. */
+      /* ---- pet sprite animations(unchanged from v0.4.1)---------------- */
+      /* steps(5, jump-none) + to: -4*W is the macOS-26-safe pattern; see
+       * v0.4.0 release notes for the long debugging story. */
       .pet.idle    { animation: row-idle    var(--dur, 1100ms) steps(5, jump-none) infinite; }
       .pet.wave    { animation: row-wave    var(--dur, 1100ms) steps(5, jump-none) infinite; }
       .pet.run     { animation: row-run     var(--dur, 1100ms) steps(5, jump-none) infinite; }
@@ -181,6 +231,20 @@
   </head>
   <body data-tauri-drag-region>
     <div class="stage" data-tauri-drag-region>
+      <!-- Pet sprite + toggle handle (top-right) -->
+      <div class="pet-host" id="pet-host">
+        <div class="pet idle" id="pet" data-tauri-drag-region></div>
+        <button class="pet-toggle" id="pet-toggle" type="button" title="">
+          <svg class="pet-toggle-chevron" viewBox="0 0 12 8" width="11" height="7"
+               fill="none" stroke="currentColor" stroke-width="1.8"
+               stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <polyline points="1.5 1.5, 6 6, 10.5 1.5" />
+          </svg>
+          <span class="pet-toggle-count" aria-hidden="true"></span>
+        </button>
+      </div>
+
+      <!-- Task card (below pet) -->
       <div class="bubble" id="bubble">
         <div class="bubble-row">
           <span class="badge" aria-hidden="true"></span>
@@ -189,19 +253,31 @@
         </div>
         <div class="subtitle" id="bubble-subtitle"></div>
       </div>
-      <div class="pet idle" id="pet" data-tauri-drag-region></div>
     </div>
     <script>
       const STATES = ['idle', 'wave', 'run', 'jump', 'review', 'failed', 'extra1', 'extra2'];
       const invoke = window.__TAURI__?.core?.invoke ?? window.__TAURI_INTERNALS__?.invoke;
       const listen = window.__TAURI__?.event?.listen;
 
+      const petHostEl = document.getElementById('pet-host');
       const petEl = document.getElementById('pet');
+      const toggleEl = document.getElementById('pet-toggle');
+      const toggleCountEl = toggleEl.querySelector('.pet-toggle-count');
       const bubbleEl = document.getElementById('bubble');
       const bubbleTitleEl = document.getElementById('bubble-title');
       const bubbleSubtitleEl = document.getElementById('bubble-subtitle');
       let currentState = 'idle';
       let bubbleHideTimer = null;
+
+      // Latest task-card payload from broker (cache for show/hide on toggle).
+      let lastCard = null;       // { title, subtitle, loading } | null
+      let activeCount = 0;       // Number of active mavis sessions
+
+      // User-controlled collapsed state, persisted across reloads.
+      const COLLAPSED_KEY = 'mavis-pet:collapsed';
+      let collapsed = (() => {
+        try { return localStorage.getItem(COLLAPSED_KEY) === '1'; } catch { return false; }
+      })();
 
       async function loadPet(slug = null) {
         if (!invoke) { console.error('[mavis-pet] Tauri invoke not available'); return; }
@@ -245,47 +321,70 @@
         currentState = state;
       }
 
-      /**
-       * v0.4 task-card bubble. Three modes:
-       *  - { title, subtitle, loading } → full task card (badge + title + spinner + subtitle)
-       *  - { title }                    → card with title only (no subtitle)
-       *  - { bubble }                   → legacy compact pill (back-compat)
-       *
-       * `ttlMs` overrides default 2500ms; pass undefined for sticky (no auto-hide).
-       */
-      function showBubble(opts) {
-        if (!opts) return;
-        let title = opts.title || opts.bubble || '';
-        let subtitle = opts.subtitle || '';
-        const loading = !!opts.loading;
-        const compact = !opts.title && !opts.subtitle;   // legacy pill style
-        const ttlMs = opts.ttlMs;
-
-        if (!title && !subtitle) return;
-
-        bubbleTitleEl.textContent = title;
-        bubbleSubtitleEl.textContent = subtitle;
-        bubbleEl.classList.toggle('compact', compact);
-        bubbleEl.classList.toggle('loading', loading && !compact);
-        bubbleEl.classList.add('show');
-
-        if (bubbleHideTimer) {
-          clearTimeout(bubbleHideTimer);
-          bubbleHideTimer = null;
+      // ---- Card rendering -------------------------------------------------
+      // The card is a singleton always-on display (v0.4.2). Visibility rules:
+      //   - activeCount == 0           → hidden (no tasks)
+      //   - collapsed == true          → hidden (user folded)
+      //   - else                       → shown with lastCard contents
+      function renderUi() {
+        // Toggle visibility of the toggle handle + its skin.
+        if (activeCount > 0) {
+          petHostEl.classList.add('has-tasks');
+          if (collapsed) {
+            petHostEl.classList.add('collapsed');
+            toggleCountEl.textContent = activeCount > 99 ? '99+' : String(activeCount);
+            toggleEl.title = `${activeCount} active task${activeCount === 1 ? '' : 's'} — click to expand`;
+          } else {
+            petHostEl.classList.remove('collapsed');
+            toggleCountEl.textContent = '';
+            toggleEl.title = 'Click to collapse task card';
+          }
+        } else {
+          petHostEl.classList.remove('has-tasks', 'collapsed');
         }
-        if (typeof ttlMs === 'number' && ttlMs > 0) {
+
+        // Card visibility.
+        const shouldShowCard = activeCount > 0 && !collapsed && lastCard;
+        if (!shouldShowCard) {
+          bubbleEl.classList.remove('show');
+          return;
+        }
+        bubbleTitleEl.textContent = lastCard.title || '';
+        bubbleSubtitleEl.textContent = lastCard.subtitle || '';
+        bubbleEl.classList.toggle('compact', false);
+        bubbleEl.classList.toggle('loading', !!lastCard.loading);
+        bubbleEl.classList.add('show');
+      }
+
+      // Legacy compact-pill bubble path — used by the old WS protocol when only
+      // `bubble` is set (no `title`). Auto-dismisses after ttlMs.
+      function showLegacyBubble(opts) {
+        if (!opts || !opts.bubble) return;
+        bubbleTitleEl.textContent = opts.bubble;
+        bubbleSubtitleEl.textContent = '';
+        bubbleEl.classList.add('compact', 'show');
+        bubbleEl.classList.remove('loading');
+        if (bubbleHideTimer) { clearTimeout(bubbleHideTimer); bubbleHideTimer = null; }
+        const ttlMs = opts.ttlMs ?? 2500;
+        if (ttlMs > 0) {
           bubbleHideTimer = setTimeout(() => {
             bubbleEl.classList.remove('show');
             bubbleHideTimer = null;
           }, ttlMs);
         }
-        // sticky if ttlMs is undefined / 0
       }
 
-      function hideBubble() {
-        bubbleEl.classList.remove('show');
-        if (bubbleHideTimer) { clearTimeout(bubbleHideTimer); bubbleHideTimer = null; }
-      }
+      // Wire the toggle button.
+      toggleEl.addEventListener('click', (e) => {
+        e.stopPropagation();
+        // Don't toggle if there's nothing to show.
+        if (activeCount === 0) return;
+        collapsed = !collapsed;
+        try { localStorage.setItem(COLLAPSED_KEY, collapsed ? '1' : '0'); } catch {}
+        renderUi();
+      });
+      // Prevent the click from also dragging the window.
+      toggleEl.addEventListener('mousedown', (e) => e.stopPropagation());
 
       // ---- WS client -----------------------------------------------------
       const WS_URL = 'ws://127.0.0.1:7857/ws';
@@ -301,23 +400,39 @@
             const msg = JSON.parse(ev.data);
             if (msg.type === 'state' && typeof msg.state === 'string') {
               setState(msg.state);
-              // v0.4: prefer task-card fields; fall back to legacy `bubble` pill
-              if (msg.title || msg.subtitle || msg.bubble) {
-                showBubble({
-                  title: msg.title,
-                  subtitle: msg.subtitle,
-                  loading: msg.loading,
-                  bubble: msg.bubble,
-                  ttlMs: msg.bubbleTtlMs,
-                });
+
+              // v0.4.2 — track active session count if present.
+              if (typeof msg.activeSessionCount === 'number') {
+                activeCount = Math.max(0, msg.activeSessionCount);
+              }
+
+              // Card data: only update lastCard if title is actually set.
+              // Empty title with activeCount > 0 means "we're tracking N
+              // sessions but don't have title data yet" — keep showing
+              // whatever we had.
+              if (msg.title || msg.subtitle) {
+                lastCard = {
+                  title: msg.title || '',
+                  subtitle: msg.subtitle || '',
+                  loading: !!msg.loading,
+                };
+              } else if (msg.title === '' && msg.subtitle === '' && activeCount === 0) {
+                // Explicit clear (no active session).
+                lastCard = null;
+              }
+              renderUi();
+
+              // Legacy fallback: only `bubble` set (old protocol).
+              if (msg.bubble && !msg.title) {
+                showLegacyBubble({ bubble: msg.bubble, ttlMs: msg.bubbleTtlMs });
               }
             } else if (msg.type === 'pet' && typeof msg.slug === 'string') {
               loadPet(msg.slug);
             } else if (msg.type === 'bubble') {
-              // v0.4: standalone bubble nudge (no state change)
-              showBubble(msg);
+              showLegacyBubble(msg);
             } else if (msg.type === 'bubble-hide') {
-              hideBubble();
+              bubbleEl.classList.remove('show');
+              if (bubbleHideTimer) { clearTimeout(bubbleHideTimer); bubbleHideTimer = null; }
             }
           } catch { /* ignore non-JSON */ }
         };
@@ -334,10 +449,13 @@
 
       window.addEventListener('DOMContentLoaded', () => {
         loadPet(null);
+        renderUi();   // initial: nothing to show, but apply collapsed class state
         connect();
 
         document.body.addEventListener('mousedown', async (e) => {
           if (e.button !== 0) return;
+          // Don't start a window drag if the user clicked the toggle button.
+          if (e.target.closest('.pet-toggle')) return;
           try {
             const w = window.__TAURI__?.window?.getCurrentWindow?.();
             if (w?.startDragging) {

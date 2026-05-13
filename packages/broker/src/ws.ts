@@ -65,6 +65,7 @@ export class WsHub implements Broadcaster {
    * Broadcast a state change. Optional fields:
    *  - bubble                — legacy compact pill text
    *  - title/subtitle/loading— v0.4 task-card fields
+   *  - activeSessionCount    — v0.4.2 collapsed-state badge counter
    *  - bubbleTtlMs           — shared by both; undefined = sticky
    */
   broadcastState(
@@ -76,6 +77,7 @@ export class WsHub implements Broadcaster {
       subtitle?: string;
       loading?: boolean;
       bubbleTtlMs?: number;
+      activeSessionCount?: number;
     },
   ): void {
     const msg: WsOutMessage = { type: "state", state, ts };
@@ -84,6 +86,9 @@ export class WsHub implements Broadcaster {
     if (opts?.subtitle) msg.subtitle = opts.subtitle;
     if (typeof opts?.loading === "boolean") msg.loading = opts.loading;
     if (typeof opts?.bubbleTtlMs === "number") msg.bubbleTtlMs = opts.bubbleTtlMs;
+    if (typeof opts?.activeSessionCount === "number") {
+      msg.activeSessionCount = opts.activeSessionCount;
+    }
     this.broadcast(msg);
   }
 

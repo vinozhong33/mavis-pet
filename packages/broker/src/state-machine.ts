@@ -142,6 +142,21 @@ export class StateMachine {
     }));
   }
 
+  /**
+   * v0.4.2 — count of sessions whose effective state is "active" from the
+   * UI's perspective. Drives the floater's collapsed-state badge ("①").
+   * "Active" = anything that's actively running or waiting for the user
+   * (not idle). idle / extra2 (session ended) are not counted.
+   */
+  activeSessionCount(): number {
+    let n = 0;
+    for (const s of this.sessions.values()) {
+      const eff = this.effectiveState(s);
+      if (eff !== "idle" && eff !== "extra2") n += 1;
+    }
+    return n;
+  }
+
   /** Process an inbound hook event. */
   ingest(event: HookEvent): void {
     const now = event.ts ?? this.clock.now();

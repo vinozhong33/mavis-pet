@@ -162,7 +162,7 @@ describe("broker HTTP + WS integration", () => {
     expect(r.status).toBe(204);
 
     const m = await c.waitFor((m) => m.type === "state" && m.state === "run");
-    expect(m).toEqual({ type: "state", state: "run", ts: expect.any(Number) });
+    expect(m).toMatchObject({ type: "state", state: "run", ts: expect.any(Number), activeSessionCount: 1 });
     await c.close();
   });
 
@@ -431,8 +431,19 @@ describe("broker HTTP + WS integration", () => {
     await postEvent({ kind: "PreToolUse", sessionId: "s1" });
     const run = await c.waitFor((m) => m.type === "state" && m.state === "run");
 
-    // Strict equality — no extra title/subtitle/loading/bubble fields.
-    expect(run).toEqual({ type: "state", state: "run", ts: expect.any(Number) });
+    // No title / subtitle / loading / bubble (run intentionally has no
+    // default card — needs real SSE-driven data). v0.4.2: but DOES carry
+    // activeSessionCount for the floater badge.
+    expect(run).toMatchObject({
+      type: "state",
+      state: "run",
+      ts: expect.any(Number),
+      activeSessionCount: 1,
+    });
+    expect(run).not.toHaveProperty("title");
+    expect(run).not.toHaveProperty("subtitle");
+    expect(run).not.toHaveProperty("loading");
+    expect(run).not.toHaveProperty("bubble");
     await c.close();
   });
 });
