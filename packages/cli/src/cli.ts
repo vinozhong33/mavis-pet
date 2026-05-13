@@ -162,10 +162,62 @@ function resolveFloater(): string {
   throw new Error('cannot locate floater binary — set MAVIS_PET_FLOATER to its path');
 }
 
+/**
+ * Locate a pet bundled inside this npm package (packages/cli/assets/pets/<slug>/).
+ * Returns null if not bundled. Used as a zero-network fallback by cmdInstall so
+ * `mavis-pet install mikoko` works even when the petdex manifest is unreachable
+ * or hasn't yet listed a pet (v0.4.2: mikoko is the default and ships in-tree).
+ *
+ * Path resolution:
+ *   - dev workspace: dist/cli.js → ../assets/pets/<slug>          (packages/cli/assets)
+ *   - npm install:   node_modules/mavis-pet/dist/cli.js → same    (assets is in `files`)
+ */
+function resolveBundledPet(slug: string): string | null {
+  const dir = path.resolve(__dirname, '..', 'assets', 'pets', slug);
+  const pet = path.join(dir, 'pet.json');
+  const webp = path.join(dir, 'spritesheet.webp');
+  const png = path.join(dir, 'spritesheet.png');
+  if (fs.existsSync(pet) && (fs.existsSync(webp) || fs.existsSync(png))) {
+    return dir;
+  }
+  return null;
+}
+
+function copyBundledPet(srcDir: string, slug: string) {
+  const dest = path.join(PET_DIR, slug);
+  ensureDir(dest);
+  for (const name of ['pet.json', 'spritesheet.webp', 'spritesheet.png']) {
+    const src = path.join(srcDir, name);
+    if (fs.existsSync(src)) {
+      fs.copyFileSync(src, path.join(dest, name));
+    }
+  }
+}
+
 // ---- commands --------------------------------------------------------------
 
 async function cmdInstall(slug: string) {
   if (!slug) throw new Error('usage: mavis-pet install <slug>');
+
+  // v0.4.2: try bundled assets first (packages/cli/assets/pets/<slug>/).
+  // mikoko ships in-tree so `mavis-pet install mikoko` always works, even
+  // offline or when the petdex manifest hasn't been updated. Other pets
+  // can be bundled the same way by dropping a directory into
+  // packages/cli/assets/pets/.
+  const bundled = resolveBundledPet(slug);
+  if (bundled) {
+    console.log(kleur.dim(`installing bundled '${slug}' from ${path.relative(HOME, bundled)}`));
+    copyBundledPet(bundled, slug);
+    const cfg = loadConfig();
+    if (!cfg.active) {
+      cfg.active = slug;
+      saveConfig(cfg);
+      console.log(kleur.green(`activated ${slug}`));
+    }
+    console.log(kleur.green(`installed ${slug}`));
+    return;
+  }
+
   console.log(kleur.dim(`fetching petdex manifest...`));
   const manifest = await fetchJson(PETDEX_MANIFEST);
   const list: any[] = manifest?.pets ?? manifest;
@@ -211,7 +263,7 @@ async function cmdList() {
   const cfg = loadConfig();
   const pets = listInstalledPets();
   if (pets.length === 0) {
-    console.log(kleur.dim('no pets installed. try: mavis-pet install boba'));
+    console.log(kleur.dim('no pets installed. try: mavis-pet install mikoko'));
     return;
   }
   for (const p of pets) {

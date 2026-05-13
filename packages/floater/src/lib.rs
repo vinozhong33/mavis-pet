@@ -132,6 +132,13 @@ fn elevate_for_fullscreen(_window: &tauri::WebviewWindow) -> Result<(), String> 
 
 // ---- Pet discovery ---------------------------------------------------------
 
+/// Default pet slug used as a tie-breaker in `first_available_pet` when no
+/// pet is explicitly active in `~/.mavis/pet/config.json`. v0.4.2: changed
+/// from `boba` to `mikoko` (petdex/issues/241 — vino's coral-red octopus
+/// submission). If `mikoko` isn't installed we fall through to the
+/// alphabetically-first installed pet.
+const DEFAULT_PET_SLUG: &str = "mikoko";
+
 fn pets_dirs() -> Vec<PathBuf> {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
     vec![home.join(".mavis/pets"), home.join(".codex/pets")]
@@ -160,6 +167,19 @@ fn locate_pet(slug: &str) -> Option<PathBuf> {
 }
 
 fn first_available_pet() -> Option<(String, PathBuf)> {
+    // v0.4.2: prefer DEFAULT_PET_SLUG (mikoko) when present, regardless of
+    // alphabetical order. This makes mikoko the out-of-the-box pet for
+    // anyone who runs `mavis-pet start` without first calling `switch`.
+    if let Some(dir) = locate_pet(DEFAULT_PET_SLUG) {
+        let pet_json = dir.join("pet.json");
+        let webp = dir.join("spritesheet.webp");
+        let png = dir.join("spritesheet.png");
+        if pet_json.exists() && (webp.exists() || png.exists()) {
+            return Some((DEFAULT_PET_SLUG.to_string(), dir));
+        }
+    }
+
+    // Fallback: first installed pet by lexicographic name across all bases.
     for base in pets_dirs() {
         if let Ok(read) = fs::read_dir(&base) {
             let mut entries: Vec<_> = read
