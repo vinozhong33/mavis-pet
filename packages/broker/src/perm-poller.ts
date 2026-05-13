@@ -64,7 +64,11 @@ const DEFAULT_DAEMON_URL =
   process.env.MAVIS_DAEMON_URL ?? "http://127.0.0.1:15321";
 
 export function startPermPoller(opts: PermPollerOptions): PermPoller {
-  const url = `${opts.daemonUrl ?? DEFAULT_DAEMON_URL}/api/permission/requests`;
+  // v0.4.2 — fix endpoint prefix. The daemon mounts all business routes under
+  // `/mavis/api/...`, not `/api/...`. v0.3 used the wrong prefix and got a
+  // permanent 404, which is why we disabled the poller by default. Now that
+  // the path is correct, re-enable by default in server.ts.
+  const url = `${opts.daemonUrl ?? DEFAULT_DAEMON_URL}/mavis/api/permission/requests`;
   const intervalMs = opts.intervalMs ?? 1500;
   const fetchTimeoutMs = opts.fetchTimeoutMs ?? 1000;
   const log = opts.logger;

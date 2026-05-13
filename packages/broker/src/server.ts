@@ -14,6 +14,11 @@ import { type Logger, createLogger } from "./logger.js";
 import { StateMachine } from "./state-machine.js";
 import { WsHub } from "./ws.js";
 import { type PermPoller, startPermPoller } from "./perm-poller.js";
+import {
+  createEventSource,
+  type ActiveSession,
+  type EventSourceHandle,
+} from "./event-source.js";
 import type { HookEvent, PetState } from "./types.js";
 
 export const DEFAULT_HOST = "127.0.0.1";
@@ -71,16 +76,26 @@ export interface BrokerOptions {
   /** Default time-to-live (ms) for bubbles. Defaults to 2500. */
   bubbleTtlMs?: number;
   /**
-   * Disable the mavis daemon permission poller (default: **disabled** as of
-   * v0.3.1 — the daemon's `/api/permission/requests` endpoint disappeared
-   * after a daemon refactor and we'd just spam the log with 404s. Set to
-   * `false` explicitly when the endpoint comes back, or override `daemonUrl`).
+   * Disable the mavis daemon permission poller.
+   *
+   * v0.4.2 — re-enabled by default. The endpoint moved to
+   * `/mavis/api/permission/requests` (see perm-poller.ts) so the 404 spam
+   * that justified disabling in v0.3.1 is gone. Set `disablePermPoller:
+   * true` for unit tests that should not touch a real daemon.
    */
   disablePermPoller?: boolean;
   /** Override daemon URL for the perm poller. Default http://127.0.0.1:15321. */
   daemonUrl?: string;
   /** Perm poll interval in ms. Default 1500. */
   permPollIntervalMs?: number;
+  /**
+   * Disable the mavis daemon SSE event-source consumer.
+   *
+   * v0.4.2 — feeds active session pool (title + last message) for the
+   * floater task card. Set `true` for unit tests that should not touch a
+   * real daemon. Default `false` (enabled).
+   */
+  disableEventSource?: boolean;
 }
 
 export interface BrokerHandle {
@@ -94,6 +109,8 @@ export interface BrokerHandle {
   wss: WebSocketServer;
   /** Perm poller handle (null if disabled). */
   permPoller: PermPoller | null;
+  /** SSE event-source handle (null if disabled). */
+  eventSource: EventSourceHandle | null;
   /** Graceful shutdown. */
   close(): Promise<void>;
 }
@@ -173,40 +190,96 @@ export async function startBroker(opts: BrokerOptions = {}): Promise<BrokerHandl
     getCurrentPet: () => petRef.slug,
   });
 
-  // Wire state changes → broadcast.
-  // Routing priority:
-  //   1. cards[state] present → emit v0.4 task-card (title + subtitle + loading)
-  //   2. else bubbles[state]  → emit legacy compact pill
-  //   3. else                  → plain state push (no bubble)
-  // Sticky states (review) skip auto-dismiss TTL — bubble stays until next push.
+  // -------------------------------------------------------------------------
+  // v0.4.2 — daemon SSE consumer (active session pool: title + lastMessage)
   //
-  // v0.4.2 — every state push now also carries activeSessionCount derived
-  // from the state machine's per-session map. Floater uses this to drive
-  // the collapsed-state badge ("①") and to decide whether the card
-  // should be visible at all (count==0 → no card).
+  // Constructed up front so the onChange listener can read it; the actual
+  // network connect happens in `start()` further down.
+  // -------------------------------------------------------------------------
+  let eventSource: EventSourceHandle | null = null;
+  if (!opts.disableEventSource) {
+    eventSource = createEventSource({
+      clock,
+      daemonUrl: opts.daemonUrl,
+      logger,
+    });
+  }
+
+  // Wire state changes → broadcast.
+  // v0.4.2 routing tree (in order of precedence):
+  //   1. SSE-driven real session data → real title + lastMessage
+  //   2. Static {@link cards} entry for this state → stub title/subtitle
+  //   3. Legacy {@link bubbles} entry → compact pill text
+  //   4. Plain state push (no card, no bubble)
+  //
+  // `loading` and `waiting` are derived purely from the state symbol now:
+  //   - loading = state ∈ {run, jump}    (agent actively working)
+  //   - waiting = state === review       (blocked on user perm)
+  // These are mutually exclusive — review's loading is false because it's
+  // semantically "not running, awaiting human"; the floater renders a clock
+  // icon instead of a spinner when `waiting` is true.
+  //
+  // Sticky states (review) skip the auto-dismiss TTL.
+  // Every push carries `activeSessionCount` for the collapsed-state badge.
   machine.onChange((state, ts) => {
     const activeSessionCount = machine.activeSessionCount();
-    const card = cards[state];
-    if (card) {
-      const sticky = state === "review";
+    const isLoading = state === "run" || state === "jump";
+    const isWaiting = state === "review";
+    const sticky = state === "review";
+
+    // 1. Try SSE-driven real session data first.
+    const sess = pickActiveSession(eventSource);
+    if (sess && (sess.title || sess.lastMessage)) {
       hub.broadcastState(state, ts, {
-        title: card.title,
-        subtitle: card.subtitle,
-        loading: card.loading,
+        title: sess.title ?? "Working...",
+        subtitle: sess.lastMessage ?? "",
+        loading: isLoading,
+        waiting: isWaiting,
         bubbleTtlMs: sticky ? undefined : bubbleTtlMs,
         activeSessionCount,
       });
       return;
     }
-    const text = bubbles[state];
-    if (!text) {
-      hub.broadcastState(state, ts, { activeSessionCount });
+
+    // 2. Static card stub (default copy for transient states).
+    const card = cards[state];
+    if (card) {
+      hub.broadcastState(state, ts, {
+        title: card.title,
+        subtitle: card.subtitle,
+        loading: isLoading,
+        waiting: isWaiting,
+        bubbleTtlMs: sticky ? undefined : bubbleTtlMs,
+        activeSessionCount,
+      });
       return;
     }
-    if (state === "review") {
-      hub.broadcastState(state, ts, { bubble: text, activeSessionCount });
+
+    // 3. Legacy bubble fallback.
+    const text = bubbles[state];
+    if (!text) {
+      // 4. Plain state — but we still ship loading/waiting/count so the
+      // floater can render badge + icon without a card body.
+      hub.broadcastState(state, ts, {
+        loading: isLoading,
+        waiting: isWaiting,
+        activeSessionCount,
+      });
+      return;
+    }
+    if (sticky) {
+      hub.broadcastState(state, ts, {
+        bubble: text,
+        waiting: true,
+        activeSessionCount,
+      });
     } else {
-      hub.broadcastState(state, ts, { bubble: text, bubbleTtlMs, activeSessionCount });
+      hub.broadcastState(state, ts, {
+        bubble: text,
+        loading: isLoading,
+        bubbleTtlMs,
+        activeSessionCount,
+      });
     }
   });
 
@@ -237,12 +310,12 @@ export async function startBroker(opts: BrokerOptions = {}): Promise<BrokerHandl
     }
   });
 
-  // Start the mavis daemon perm poller. Default DISABLED in v0.3.1 because
-  // the daemon's `/api/permission/requests` endpoint vanished after a daemon
-  // refactor (returns 404). Pass `disablePermPoller: false` explicitly to
-  // re-enable when the endpoint comes back (or override `daemonUrl`).
+  // Start the mavis daemon perm poller. v0.4.2: re-enabled by default. The
+  // endpoint moved to `/mavis/api/permission/requests` (was `/api/...` and
+  // 404'd, hence the v0.3.1 disable). Pass `disablePermPoller: true` for
+  // unit tests that should not touch a real daemon.
   let permPoller: PermPoller | null = null;
-  if (opts.disablePermPoller === false) {
+  if (!opts.disablePermPoller) {
     permPoller = startPermPoller({
       clock,
       machine,
@@ -252,11 +325,17 @@ export async function startBroker(opts: BrokerOptions = {}): Promise<BrokerHandl
     });
   }
 
+  // Kick off the SSE consumer now that the broker is otherwise ready.
+  if (eventSource) {
+    eventSource.start();
+  }
+
   logger.info("broker_started", {
     host,
     port: address.port,
     pet: petRef.slug,
     permPoller: permPoller !== null,
+    eventSource: eventSource !== null,
   });
 
   return {
@@ -268,9 +347,11 @@ export async function startBroker(opts: BrokerOptions = {}): Promise<BrokerHandl
     http,
     wss,
     permPoller,
+    eventSource,
     async close() {
       logger.info("broker_stopping");
       if (permPoller) permPoller.stop();
+      if (eventSource) eventSource.stop();
       hub.closeAll();
       await new Promise<void>((resolve) => {
         wss.close(() => resolve());
@@ -282,4 +363,20 @@ export async function startBroker(opts: BrokerOptions = {}): Promise<BrokerHandl
       logger.info("broker_stopped");
     },
   };
+}
+
+/**
+ * Pick the most-recently-touched active session from the SSE pool.
+ *
+ * Heuristic: when multiple sessions are running, the floater card has only
+ * one slot, so we surface the one the user most recently saw activity from.
+ * Returns `null` if no sessions or no event-source.
+ */
+function pickActiveSession(es: EventSourceHandle | null): ActiveSession | null {
+  if (!es) return null;
+  let best: ActiveSession | null = null;
+  for (const s of es.getActiveSessions().values()) {
+    if (!best || s.lastTouchedAt > best.lastTouchedAt) best = s;
+  }
+  return best;
 }

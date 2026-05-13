@@ -24,8 +24,10 @@ beforeEach(async () => {
     failedDegradeMs: 200,
     waveDurationMs: 100,
     idleAfterMs: 800,
-    // Tests should not poll a real mavis daemon — disable the perm poller.
+    // Tests should not poll a real mavis daemon — disable the perm poller
+    // and the SSE event-source consumer.
     disablePermPoller: true,
+    disableEventSource: true,
   });
 });
 
@@ -405,44 +407,49 @@ describe("broker HTTP + WS integration", () => {
     await c.close();
   });
 
-  it("v0.4 — PermissionRequested pushes REVIEW card with loading=true and NO TTL (sticky)", async () => {
+  it("v0.4.2 — PermissionRequested pushes REVIEW card with waiting=true and NO TTL (sticky)", async () => {
     const c = await connectWs();
     await c.waitFor((m) => m.type === "state" && m.state === "idle");
 
     await postEvent({ kind: "PermissionRequested", sessionId: "s1" });
     const review = await c.waitFor((m) => m.type === "state" && m.state === "review");
 
+    // v0.4.2 split: review = `waiting` (clock icon), not `loading` (spinner).
+    // The two are mutually exclusive — review means "blocked on user", which
+    // is semantically distinct from "actively running".
     expect(review).toMatchObject({
       type: "state",
       state: "review",
       title: "Permission needed",
       subtitle: "等你 allow",
-      loading: true,
+      waiting: true,
+      loading: false,
     });
     // Sticky — must NOT carry a TTL (undefined or absent).
     expect((review as { bubbleTtlMs?: number }).bubbleTtlMs).toBeUndefined();
     await c.close();
   });
 
-  it("v0.4 — RUN state carries no card (waits for v0.4.1 SSE session data)", async () => {
+  it("v0.4.2 — RUN state carries activeSessionCount + loading=true (no SSE-driven title yet)", async () => {
     const c = await connectWs();
     await c.waitFor((m) => m.type === "state" && m.state === "idle");
 
     await postEvent({ kind: "PreToolUse", sessionId: "s1" });
     const run = await c.waitFor((m) => m.type === "state" && m.state === "run");
 
-    // No title / subtitle / loading / bubble (run intentionally has no
-    // default card — needs real SSE-driven data). v0.4.2: but DOES carry
-    // activeSessionCount for the floater badge.
+    // No title / subtitle / bubble (run intentionally has no default card —
+    // needs real SSE-driven data, which the test broker has disabled).
+    // v0.4.2: DOES carry loading=true (spinner) + activeSessionCount=1 (badge).
     expect(run).toMatchObject({
       type: "state",
       state: "run",
       ts: expect.any(Number),
       activeSessionCount: 1,
+      loading: true,
+      waiting: false,
     });
     expect(run).not.toHaveProperty("title");
     expect(run).not.toHaveProperty("subtitle");
-    expect(run).not.toHaveProperty("loading");
     expect(run).not.toHaveProperty("bubble");
     await c.close();
   });
