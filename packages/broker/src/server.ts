@@ -219,6 +219,15 @@ export async function startBroker(opts: BrokerOptions = {}): Promise<BrokerHandl
         const ts = clock.now();
         broadcastForState(state, ts);
       },
+      // v0.4.4 — primary perm-pending signal. Daemon emits `permission.ask`
+      // on EventBus the moment a tool call hits a permission gate; we
+      // forward it to the state machine immediately (~100ms latency,
+      // was 1.5s via perm-poller). The poller is retained as a
+      // `PermissionResolved` detector only (daemon doesn't emit a
+      // corresponding `permission.resolved` event).
+      onPermissionAsk: (sid) => {
+        machine.ingest({ kind: "PermissionRequested", sessionId: sid });
+      },
     });
   }
 

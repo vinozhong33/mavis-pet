@@ -83,6 +83,16 @@ export interface ActiveSession {
    * subtitle reflects live streaming output. Cleared on session.finish.
    */
   pollTimer?: TimerHandle | null;
+  /**
+   * v0.4.4 — minimum daemon-message timestamp to accept into `lastMessage`.
+   * Set to `clock.now()` on every session.start so the polling loop's
+   * first fetch (which races against the daemon producing the new turn's
+   * first assistant chunk) doesn't pull the previous turn's final reply
+   * back in and reanimate stale "done" text on the card. Once a fresh
+   * assistant chunk lands (timestamp > this), it overwrites lastMessage
+   * normally.
+   */
+  lastTurnStartTimestamp?: number;
 }
 
 export interface EventSourceOptions {
@@ -114,6 +124,17 @@ export interface EventSourceOptions {
    * doesn't go through hook events). Pass null to disable (e.g. tests).
    */
   onSessionUpdate?: () => void;
+  /**
+   * v0.4.4 — fired when daemon emits `permission.ask` SSE event for a
+   * session, replacing the old 1.5s perm-poller as the primary "perm
+   * pending" signal source. Server wires this to
+   * `machine.ingest({kind: "PermissionRequested", sessionId})`. The
+   * perm-poller is retained only as a `PermissionResolved` detector
+   * (daemon does NOT emit a corresponding `permission.resolved` event,
+   * so we still need to diff the pending list to learn when an ask is
+   * answered). Pass null to disable (e.g. tests).
+   */
+  onPermissionAsk?: (sessionId: string, requestId?: string) => void;
 }
 
 export interface EventSourceHandle {
@@ -209,7 +230,10 @@ export function createEventSource(opts: EventSourceOptions): EventSourceHandle {
     return undefined;
   }
 
-  async function fetchLatestMessage(sid: string): Promise<string | undefined> {
+  async function fetchLatestMessage(
+    sid: string,
+    minTimestamp?: number,
+  ): Promise<string | undefined> {
     try {
       // v0.4.3 — pull a small batch (5) and pick the most-recent
       // ASSISTANT message that has actual text content. We can't ask for
@@ -218,6 +242,11 @@ export function createEventSource(opts: EventSourceOptions): EventSourceHandle {
       // to show. The daemon real schema is `{role, msg_type, msg_content,
       // tool_calls, timestamp, ...}`; assistant msg_type=1 is pure text,
       // msg_type=2 may be tool_call with optional msg_content commentary.
+      //
+      // v0.4.4 — `minTimestamp` (optional): when set, skip any message
+      // whose timestamp <= minTimestamp. Used by `startMessagePolling` to
+      // avoid pulling the previous turn's final reply during the race
+      // window between session.start and the new turn's first chunk.
       const r = await fetchImpl(
         `${baseUrl}/mavis/api/session/${sid}/message?limit=5`,
       );
@@ -237,9 +266,15 @@ export function createEventSource(opts: EventSourceOptions): EventSourceHandle {
         .sort((a, b) => (b.timestamp ?? 0) - (a.timestamp ?? 0));
       for (const m of sorted) {
         if (m.role !== "assistant") continue;
-        if (typeof m.msg_content === "string" && m.msg_content.trim()) {
-          return truncate(m.msg_content, maxMessageChars);
+        if (typeof m.msg_content !== "string" || !m.msg_content.trim())
+          continue;
+        if (
+          typeof minTimestamp === "number" &&
+          (typeof m.timestamp !== "number" || m.timestamp <= minTimestamp)
+        ) {
+          continue;
         }
+        return truncate(m.msg_content, maxMessageChars);
       }
     } catch (err) {
       log?.debug("event_source_fetch_message_failed", {
@@ -315,6 +350,14 @@ export function createEventSource(opts: EventSourceOptions): EventSourceHandle {
         // v0.4.3 — reset live status to "thinking" for the new turn.
         // PreToolUse will overwrite with a more specific verb if a tool fires.
         sess.currentAction = "正在思考";
+        // v0.4.4 — bug fix: explicitly clear the previous turn's
+        // lastMessage so the floater card stops showing stale "done"
+        // text while the new turn is mid-flight. Combined with
+        // `lastTurnStartTimestamp` below, the polling loop's first
+        // fetch (which races against daemon producing the new turn's
+        // first chunk) won't pull the prior reply back in.
+        sess.lastMessage = undefined;
+        sess.lastTurnStartTimestamp = opts.clock.now();
         cancelEvict(sess);
         if (!sess.title || !sess.displayName) {
           const info = await fetchSessionTitle(sid);
@@ -325,10 +368,6 @@ export function createEventSource(opts: EventSourceOptions): EventSourceHandle {
         // floater card subtitle reflects the streaming reply chunk-by-chunk
         // (daemon doesn't push tokens via /api/events).
         startMessagePolling(sess);
-        // Refresh lastMessage on every turn-start (user probably just sent
-        // a new prompt; we'll get the assistant reply via subsequent polls).
-        const fetched = await fetchLatestMessage(sid);
-        if (fetched) sess.lastMessage = fetched;
         break;
       }
       case "session.finish": {
@@ -356,6 +395,28 @@ export function createEventSource(opts: EventSourceOptions): EventSourceHandle {
       case "session.abort": {
         // Drop session immediately; no longer interesting to surface.
         sessions.delete(sid);
+        break;
+      }
+      case "permission.ask": {
+        // v0.4.4 — primary perm-pending signal source. Daemon emits this
+        // when a tool call hits a permission gate, before the perm-poller's
+        // 1.5s loop even gets a chance to see the new entry. We forward
+        // immediately to the broker state machine via the
+        // `onPermissionAsk` callback (server.ts wires this to
+        // `machine.ingest({kind: "PermissionRequested", sessionId})`).
+        //
+        // The perm-poller (now polling every 5s instead of 1.5s) is
+        // retained ONLY as a `PermissionResolved` detector — daemon
+        // doesn't emit a corresponding `permission.resolved` event, so
+        // we still need to diff the pending-list to learn when a perm
+        // gets answered.
+        const payload =
+          (data && typeof data === "object" && (data as { payload?: unknown }).payload) || {};
+        const requestId =
+          payload && typeof payload === "object"
+            ? (payload as { requestId?: unknown }).requestId
+            : undefined;
+        opts.onPermissionAsk?.(sid, typeof requestId === "string" ? requestId : undefined);
         break;
       }
       default: {
@@ -419,7 +480,14 @@ export function createEventSource(opts: EventSourceOptions): EventSourceHandle {
         return;
       }
       try {
-        const fetched = await fetchLatestMessage(s.sessionId);
+        // v0.4.4 — pass `lastTurnStartTimestamp` so a polling fetch that
+        // races against daemon producing the new turn's first chunk
+        // skips the previous turn's final reply (avoids stale "done"
+        // text resurrecting on the card).
+        const fetched = await fetchLatestMessage(
+          s.sessionId,
+          s.lastTurnStartTimestamp,
+        );
         if (fetched && fetched !== s.lastMessage) {
           s.lastMessage = fetched;
           s.lastTouchedAt = opts.clock.now();
@@ -733,32 +801,6 @@ function extractTitleFromPayload(data: unknown): string | undefined {
   if (payload && typeof payload === "object") {
     const t = (payload as { title?: unknown }).title;
     if (typeof t === "string" && t.trim()) return t.trim();
-  }
-  return undefined;
-}
-
-function extractMessageContent(data: unknown): string | undefined {
-  if (!data) return undefined;
-  if (typeof data === "string") return data;
-  if (typeof data !== "object") return undefined;
-  const o = data as Record<string, unknown>;
-  // Try several common shapes.
-  if (typeof o.content === "string") return o.content;
-  if (typeof o.text === "string") return o.text;
-  if (typeof o.preview === "string") return o.preview;
-  // Anthropic-shaped: content is an array of {type:"text", text:"..."} blocks.
-  if (Array.isArray(o.content)) {
-    const parts: string[] = [];
-    for (const blk of o.content) {
-      if (
-        blk &&
-        typeof blk === "object" &&
-        typeof (blk as { text?: unknown }).text === "string"
-      ) {
-        parts.push((blk as { text: string }).text);
-      }
-    }
-    if (parts.length) return parts.join("");
   }
   return undefined;
 }

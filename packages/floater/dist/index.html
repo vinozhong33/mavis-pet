@@ -219,6 +219,12 @@
       .bubble.waiting .check   { opacity: 0; }
       /* done takes precedence over loading: check visible, spinner hidden. */
       .bubble.done    .spinner { opacity: 0; }
+      /* v0.4.4 — done state: cursor changes to pointer over the whole card
+       * to signal "click/hover anywhere to dismiss". Combined with the JS
+       * mouseenter listener below, the entire .bubble area is the hit zone
+       * (semantics restored from v0.4.3 after a misunderstood v0.4.4 detour
+       * that tried to require an explicit X click). */
+      .bubble.done    { cursor: pointer; }
       @keyframes bubble-spin { to { transform: rotate(360deg); } }
 
       .bubble .subtitle {
@@ -304,8 +310,7 @@
               <line x1="7" y1="7" x2="9.5" y2="7" />
             </svg>
             <!-- v0.4.3 — green check icon: shown when broker reports
-                 done:true (session.finish). iOS system green (#34c759).
-                 Same 14x14 footprint as spinner/clock. -->
+                 done:true (session.finish). iOS system green (#34c759). -->
             <svg class="check" viewBox="0 0 14 14"
                  fill="none" stroke="currentColor" stroke-width="1.8"
                  stroke-linecap="round" stroke-linejoin="round">
@@ -456,9 +461,8 @@
 
       // v0.4.3 — when card is in `done` state (✓ green), hovering anywhere
       // on the card POSTs /dismiss so the broker evicts the session and
-      // the card disappears. This replaces the pre-v0.4.3 5-minute auto-
-      // evict timer (vino wanted manual dismiss). Once dismissed, broker
-      // re-broadcasts which clears lastCard → card hides via renderUi.
+      // the card disappears. (v0.4.4 detour: tried explicit X click —
+      // wasn't what vino wanted; reverted to hover semantics.)
       bubbleEl.addEventListener('mouseenter', () => {
         if (!bubbleEl.classList.contains('done')) return;
         fetch('http://127.0.0.1:7857/dismiss', { method: 'POST' }).catch(() => {

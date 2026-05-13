@@ -1,33 +1,33 @@
 /**
- * Pet Broker — mavis daemon permission poller.
+ * Pet Broker — mavis daemon permission poller (v0.4.4 simplified).
  *
- * mavis daemon currently does NOT emit hook events for permission requests
- * (PreToolUse/PostToolUse fire AFTER perm is resolved, so they're useless
- * for the "agent is waiting on user decision" signal). But the daemon DOES
- * expose `GET /api/permission/requests` which returns all currently pending
- * permission requests.
+ * Daemon emits `permission.ask` on EventBus when a perm gate hits, but does
+ * NOT emit a corresponding `permission.resolved`/`granted`/`denied` event.
  *
- * This module polls that endpoint every `intervalMs` (default 1500ms), diffs
- * against the previous poll to detect:
- *   - new requestId → emit PermissionRequested for that session
- *   - missing requestId → emit PermissionResolved for that session
+ * As of v0.4.4 the poller's responsibilities split cleanly:
  *
- * Resulting events are pushed through the same StateMachine.ingest path as
- * normal hook events, so the rest of the broker pipeline (state machine,
- * WS broadcast, default bubbles) needs no special-casing.
+ *   - REQUESTED signal → handled by SSE `permission.ask` subscriber in
+ *     `event-source.ts` (~100ms latency, was 1.5s).
+ *   - RESOLVED signal → handled here, by polling `GET /mavis/api/permission/requests`
+ *     every `intervalMs` (default 5000ms) and diffing against the previous
+ *     poll. Vanished requestIds → `PermissionResolved`.
  *
- * Polling is the recommended path because:
- *   - zero daemon-side changes required
- *   - covers ALL perm sources (CLI prompts, IM bridge, cron, etc.) automatically
- *   - the resolved signal is "free" via set difference, no second emit point needed
- *   - tradeoff is 1.5s latency, which is fine for an ambient-signal floater
+ * Why we still need polling: the alternative — assuming a `PreToolUse` hook
+ * arrival means perm got allow'd — fails for the deny path (no subsequent
+ * tool call ever fires; session may sit idle indefinitely).
+ *
+ * Zombie-entry protection: after `stalePollThreshold` consecutive polls
+ * (default 3 ≈ 15s with 5s interval) the poller treats the request as
+ * approved-but-not-cleared (a known daemon quirk where the perm endpoint
+ * sometimes leaves answered entries in the pending list) and forces a
+ * `PermissionResolved` so the floater doesn't get stuck in clock state.
  */
 
 import type { Clock, TimerHandle } from "./clock.js";
 import type { Logger } from "./logger.js";
 import type { StateMachine } from "./state-machine.js";
 
-/** Shape of one entry in `GET /api/permission/requests`. */
+/** Shape of one entry in `GET /mavis/api/permission/requests`. */
 interface PermissionRequest {
   requestId: string;
   sessionId: string;
@@ -46,10 +46,17 @@ export interface PermPollerOptions {
   machine: StateMachine;
   /** Daemon URL, e.g. http://127.0.0.1:15321. Default reads MAVIS_DAEMON_URL or http://127.0.0.1:15321 */
   daemonUrl?: string;
-  /** Poll interval in ms. Default 1500. */
+  /** Poll interval in ms. Default 5000 (was 1500 pre-v0.4.4). */
   intervalMs?: number;
-  /** Per-request timeout in ms. Default 1000. */
+  /** Per-request timeout in ms. Default 1500. */
   fetchTimeoutMs?: number;
+  /**
+   * v0.4.4 — # of consecutive polls a requestId can persist before being
+   * treated as zombie (force PermissionResolved). Default 3 ≈ 15s with
+   * 5s intervalMs. Lower = quicker UX recovery; higher = more tolerant
+   * of slow user response.
+   */
+  stalePollThreshold?: number;
   logger?: Logger;
 }
 
@@ -64,17 +71,27 @@ const DEFAULT_DAEMON_URL =
   process.env.MAVIS_DAEMON_URL ?? "http://127.0.0.1:15321";
 
 export function startPermPoller(opts: PermPollerOptions): PermPoller {
-  // v0.4.2 — fix endpoint prefix. The daemon mounts all business routes under
-  // `/mavis/api/...`, not `/api/...`. v0.3 used the wrong prefix and got a
-  // permanent 404, which is why we disabled the poller by default. Now that
-  // the path is correct, re-enable by default in server.ts.
   const url = `${opts.daemonUrl ?? DEFAULT_DAEMON_URL}/mavis/api/permission/requests`;
-  const intervalMs = opts.intervalMs ?? 1500;
-  const fetchTimeoutMs = opts.fetchTimeoutMs ?? 1000;
+  const intervalMs = opts.intervalMs ?? 5000;
+  const fetchTimeoutMs = opts.fetchTimeoutMs ?? 1500;
+  const stalePollThreshold = opts.stalePollThreshold ?? 3;
   const log = opts.logger;
 
   /** requestId → sessionId of the LAST poll. */
   let seen = new Map<string, string>();
+  /** Per-requestId staleness counter (zombie detection). */
+  const stalePollCount = new Map<string, number>();
+  /**
+   * v0.4.4.1 — `requestId`s already force-resolved as zombies. Daemon may
+   * keep returning them in the pending list indefinitely (the original
+   * "daemon never clears approved perms" bug); without this set, every
+   * `stalePollThreshold` polls (~15s) we'd re-fire `PermissionResolved`
+   * forever, spamming logs and bouncing the broker state machine.
+   *
+   * Cleanup: when a reqId vanishes from cur (daemon finally cleared it),
+   * we drop it from this set so memory doesn't grow unbounded.
+   */
+  const processedZombies = new Set<string>();
   let timer: TimerHandle | null = null;
   let stopped = false;
   /** Backoff after consecutive failures so we don't spam logs. */
@@ -117,20 +134,63 @@ export function startPermPoller(opts: PermPollerOptions): PermPoller {
       }
     }
 
-    // New requests → PermissionRequested for those sessions
-    for (const [reqId, sid] of cur) {
-      if (!seen.has(reqId)) {
-        opts.machine.ingest({ kind: "PermissionRequested", sessionId: sid });
-      }
+    // v0.4.4.1 — gc processedZombies for entries the daemon finally cleared.
+    for (const reqId of processedZombies) {
+      if (!cur.has(reqId)) processedZombies.delete(reqId);
     }
-    // Vanished requests → PermissionResolved
+
+    // Zombie detection: bump per-requestId staleness counter for entries
+    // still in cur (and NOT already-processed zombies). Drop counters for
+    // entries that vanished.
+    const zombies = new Set<string>();
+    for (const reqId of cur.keys()) {
+      if (processedZombies.has(reqId)) continue; // already force-resolved
+      const next = (stalePollCount.get(reqId) ?? 0) + 1;
+      stalePollCount.set(reqId, next);
+      if (next > stalePollThreshold) zombies.add(reqId);
+    }
+    for (const reqId of stalePollCount.keys()) {
+      if (!cur.has(reqId)) stalePollCount.delete(reqId);
+    }
+
+    // v0.4.4 — REMOVED: "new requestId → emit PermissionRequested" branch.
+    // The SSE `permission.ask` subscriber in event-source.ts now owns this
+    // signal. Polling here would be a redundant second emit.
+
+    // Vanished requestIds → PermissionResolved.
     for (const [reqId, sid] of seen) {
       if (!cur.has(reqId)) {
         opts.machine.ingest({ kind: "PermissionResolved", sessionId: sid });
       }
     }
 
-    seen = cur;
+    // Zombie requestIds: still in cur but stale → force PermissionResolved
+    // ONCE, then mark as processed so subsequent polls skip them. Without
+    // the processedZombies set, we'd re-fire every ~15s for any perm the
+    // daemon refuses to clear, spamming logs and confusing UI.
+    for (const reqId of zombies) {
+      const sid = cur.get(reqId);
+      if (sid) {
+        opts.machine.ingest({ kind: "PermissionResolved", sessionId: sid });
+        log?.warn("perm_poll_zombie_resolved", {
+          requestId: reqId,
+          sessionId: sid,
+          stalePolls: stalePollCount.get(reqId),
+        });
+        processedZombies.add(reqId);
+        stalePollCount.delete(reqId);
+      }
+    }
+
+    // Build new `seen` from cur — but exclude processed zombies so the
+    // vanish-detect branch above doesn't re-emit Resolved for them when
+    // the daemon eventually clears them. (They're already considered
+    // resolved from the floater's perspective.)
+    const nextSeen = new Map<string, string>();
+    for (const [reqId, sid] of cur) {
+      if (!processedZombies.has(reqId)) nextSeen.set(reqId, sid);
+    }
+    seen = nextSeen;
   }
 
   function schedule(): void {
@@ -145,11 +205,18 @@ export function startPermPoller(opts: PermPollerOptions): PermPoller {
     }, intervalMs);
   }
 
-  // Kick off the first poll immediately so a user already has a pending perm
-  // when broker starts will be picked up without waiting `intervalMs`.
+  // v0.4.4 — first poll runs once to seed `seen` so we don't fire spurious
+  // PermissionResolved on startup for requests that were already pending
+  // before broker started. SSE permission.ask subscriber handles new asks
+  // from the moment broker connects.
   void pollOnce().then(() => schedule());
 
-  log?.info("perm_poller_started", { url, intervalMs });
+  log?.info("perm_poller_started", {
+    url,
+    intervalMs,
+    stalePollThreshold,
+    role: "resolved-detector-only (v0.4.4+)",
+  });
 
   return {
     stop() {

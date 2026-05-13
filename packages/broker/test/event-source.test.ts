@@ -317,6 +317,80 @@ describe("event-source — daemon-real-shape sanity", () => {
 
     expect(es.activeCount()).toBe(0);
   });
+
+  it("v0.4.4 — permission.ask fires onPermissionAsk with sessionId+requestId", async () => {
+    const m = mockFetch({});
+    const clock = new FakeClock();
+    const calls: Array<{ sid: string; reqId: string | undefined }> = [];
+    es = createEventSource({
+      clock,
+      daemonUrl: "http://localhost:9999",
+      logger: NullLogger,
+      fetchImpl: m.fetch,
+      onPermissionAsk: (sid, reqId) => {
+        calls.push({ sid, reqId });
+      },
+    });
+    es.start();
+    const stream = await m.waitForSseConnect();
+
+    stream.push(
+      'event: permission.ask\n' +
+        'data: {"type":"permission.ask","timestamp":1,"source":"session-bridge",' +
+        '"payload":{"sessionId":"ses_perm","agentName":"main","requestId":"perm_abc",' +
+        '"toolName":"bash","toolInput":{"command":"ls"},"ruleContents":["ls:*"]}}\n\n',
+    );
+    await flushMicrotasks(20);
+    await es.whenIdle();
+
+    expect(calls.length).toBe(1);
+    expect(calls[0].sid).toBe("ses_perm");
+    expect(calls[0].reqId).toBe("perm_abc");
+  });
+
+  it("v0.4.4 — session.start clears stale lastMessage from previous turn (bug fix)", async () => {
+    const m = mockFetch({
+      "/mavis/api/session/ses_clear": {
+        session: { sessionId: "ses_clear", displayName: "main" },
+      },
+    });
+    const clock = new FakeClock();
+    es = createEventSource({
+      clock,
+      daemonUrl: "http://localhost:9999",
+      logger: NullLogger,
+      fetchImpl: m.fetch,
+    });
+    es.start();
+    const stream = await m.waitForSseConnect();
+
+    // First turn: start → finish → session has lastMessage from final reply (simulated).
+    stream.push(
+      'event: session.start\ndata: {"type":"session.start","timestamp":1,"source":"x","payload":{"sessionId":"ses_clear"}}\n\n' +
+        'event: session.finish\ndata: {"type":"session.finish","timestamp":2,"source":"x","payload":{"sessionId":"ses_clear"}}\n\n',
+    );
+    await flushMicrotasks(20);
+    await es.whenIdle();
+
+    // Manually inject a stale lastMessage (simulates final reply from previous turn).
+    const sess = es.getActiveSessions().get("ses_clear");
+    expect(sess).toBeDefined();
+    sess!.lastMessage = "previous turn final reply";
+
+    // New turn arrives — session.start MUST clear lastMessage so the floater
+    // card stops showing previous reply while new turn is mid-flight.
+    stream.push(
+      'event: session.start\ndata: {"type":"session.start","timestamp":3,"source":"x","payload":{"sessionId":"ses_clear"}}\n\n',
+    );
+    await flushMicrotasks(20);
+    await es.whenIdle();
+
+    const after = es.getActiveSessions().get("ses_clear");
+    expect(after).toBeDefined();
+    expect(after!.lastMessage).toBeUndefined();
+    // currentAction should be reset to "正在思考".
+    expect(after!.currentAction).toBe("正在思考");
+  });
 });
 
 describe("event-source — robustness", () => {
