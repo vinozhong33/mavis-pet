@@ -97,6 +97,15 @@ export interface WsStateMessage {
   subtitle?: string;
   /** v0.4 — show spinner in card top-right (means "agent is working/waiting"). */
   loading?: boolean;
+  /**
+   * v0.4.2 — show **clock/hourglass icon** instead of spinner in card top-right.
+   * Semantically distinct from `loading`:
+   *   - `loading=true`   → spinner = "agent is actively running"
+   *   - `waiting=true`   → clock   = "agent is BLOCKED waiting on user
+   *                                   action (e.g. perm approval)"
+   * Mutually exclusive at the UI level (waiting takes precedence over loading).
+   */
+  waiting?: boolean;
   /** Auto-dismiss ms; undefined = sticky until next state push. */
   bubbleTtlMs?: number;
   /** v0.4.2 — number of active mavis sessions; drives collapsed-state badge. */

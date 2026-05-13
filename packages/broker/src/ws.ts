@@ -76,6 +76,7 @@ export class WsHub implements Broadcaster {
       title?: string;
       subtitle?: string;
       loading?: boolean;
+      waiting?: boolean;
       bubbleTtlMs?: number;
       activeSessionCount?: number;
     },
@@ -85,6 +86,7 @@ export class WsHub implements Broadcaster {
     if (opts?.title) msg.title = opts.title;
     if (opts?.subtitle) msg.subtitle = opts.subtitle;
     if (typeof opts?.loading === "boolean") msg.loading = opts.loading;
+    if (typeof opts?.waiting === "boolean") msg.waiting = opts.waiting;
     if (typeof opts?.bubbleTtlMs === "number") msg.bubbleTtlMs = opts.bubbleTtlMs;
     if (typeof opts?.activeSessionCount === "number") {
       msg.activeSessionCount = opts.activeSessionCount;
