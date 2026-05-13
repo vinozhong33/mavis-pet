@@ -140,7 +140,12 @@
 
       .bubble-row {
         display: flex;
-        align-items: flex-start;
+        /* v0.4.2 (2/4): centerline-align badge ↔ title ↔ spinner/clock so
+         * the 22x22 badge midpoint sits on the title text midpoint. The
+         * old `flex-start` + per-element `margin-top` hacks (badge 1px,
+         * spinner 4px) were eyeballed offsets that drifted as soon as
+         * the title font size or row height changed. */
+        align-items: center;
         gap: 8px;
       }
       .bubble .badge {
@@ -152,7 +157,6 @@
         background-size: cover;
         background-position: center;
         background-repeat: no-repeat;
-        margin-top: 1px;
       }
       .bubble .title {
         flex: 1 1 auto;
@@ -169,7 +173,6 @@
         flex: 0 0 auto;
         width: 14px;
         height: 14px;
-        margin-top: 4px;
         border: 1.5px solid rgba(0, 0, 0, 0.15);
         border-top-color: #1a1a1a;
         border-radius: 50%;
@@ -180,9 +183,28 @@
       .bubble.loading .spinner { opacity: 1; }
       @keyframes bubble-spin { to { transform: rotate(360deg); } }
 
+      /* v0.4.2 (2/4): clock icon — shown when broker reports
+       * waiting:true (i.e. blocked on user authorization / approval).
+       * Semantically distinct from `loading` (which means "agent is
+       * actively working"). The two are mutually exclusive at the
+       * visual layer: when .bubble.waiting is set the spinner is
+       * forced opacity:0 even if .bubble.loading is also present
+       * (later rule wins on equal specificity). JS keeps the loading
+       * class untouched and only toggles `waiting`. */
+      .bubble .clock {
+        flex: 0 0 auto;
+        width: 14px;
+        height: 14px;
+        opacity: 0;
+        transition: opacity 150ms ease-out;
+        display: block;
+      }
+      .bubble.waiting .clock { opacity: 1; }
+      .bubble.waiting .spinner { opacity: 0; }
+
       .bubble .subtitle {
-        margin-top: 6px;
-        margin-left: 30px;
+        margin-top: 2px;
+        margin-left: 0;
         font-size: 12px;
         line-height: 1.35;
         color: #555555;
@@ -250,6 +272,20 @@
           <span class="badge" aria-hidden="true"></span>
           <span class="title" id="bubble-title"></span>
           <span class="spinner" aria-hidden="true"></span>
+          <!-- Clock icon — visible iff .bubble.waiting (broker reported
+               waiting:true, i.e. blocked on user authorization). 14x14
+               viewBox; circle outline (#999, grey) + 12 o'clock hour hand
+               (#f5a623, orange — visually pops to draw attention) +
+               9 o'clock minute hand (#999, grey). Hour hand is shorter
+               than the minute hand by convention so the icon reads as
+               a clock face rather than a plus sign. -->
+          <svg class="clock" viewBox="0 0 14 14" width="14" height="14"
+               fill="none" stroke-width="1.3" stroke-linecap="round"
+               stroke-linejoin="round" aria-hidden="true">
+            <circle cx="7" cy="7" r="5.5" stroke="#999999" />
+            <line x1="7" y1="7" x2="7" y2="3.5" stroke="#f5a623" />
+            <line x1="7" y1="7" x2="3.5" y2="7" stroke="#999999" />
+          </svg>
         </div>
         <div class="subtitle" id="bubble-subtitle"></div>
       </div>
@@ -270,7 +306,7 @@
       let bubbleHideTimer = null;
 
       // Latest task-card payload from broker (cache for show/hide on toggle).
-      let lastCard = null;       // { title, subtitle, loading } | null
+      let lastCard = null;       // { title, subtitle, loading, waiting } | null
       let activeCount = 0;       // Number of active mavis sessions
 
       // User-controlled collapsed state, persisted across reloads.
@@ -353,6 +389,10 @@
         bubbleSubtitleEl.textContent = lastCard.subtitle || '';
         bubbleEl.classList.toggle('compact', false);
         bubbleEl.classList.toggle('loading', !!lastCard.loading);
+        // v0.4.2 (2/4): waiting trumps loading visually (CSS rule order
+        // ensures spinner hides when waiting is on). We still leave the
+        // `loading` class as-is so semantics survive a waiting→done flip.
+        bubbleEl.classList.toggle('waiting', !!lastCard.waiting);
         bubbleEl.classList.add('show');
       }
 
@@ -363,7 +403,7 @@
         bubbleTitleEl.textContent = opts.bubble;
         bubbleSubtitleEl.textContent = '';
         bubbleEl.classList.add('compact', 'show');
-        bubbleEl.classList.remove('loading');
+        bubbleEl.classList.remove('loading', 'waiting');
         if (bubbleHideTimer) { clearTimeout(bubbleHideTimer); bubbleHideTimer = null; }
         const ttlMs = opts.ttlMs ?? 2500;
         if (ttlMs > 0) {
@@ -415,6 +455,7 @@
                   title: msg.title || '',
                   subtitle: msg.subtitle || '',
                   loading: !!msg.loading,
+                  waiting: !!msg.waiting,
                 };
               } else if (msg.title === '' && msg.subtitle === '' && activeCount === 0) {
                 // Explicit clear (no active session).
