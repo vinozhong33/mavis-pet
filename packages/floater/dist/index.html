@@ -159,7 +159,8 @@
         background-repeat: no-repeat;
       }
       .bubble .title {
-        flex: 1 1 auto;
+        flex: 0 1 auto;        /* shrink-only — don't push spinner away with empty space */
+        min-width: 0;          /* allow ellipsis to actually trigger inside flex */
         font-size: 13px;
         line-height: 1.25;
         font-weight: 700;
@@ -169,38 +170,56 @@
         text-overflow: ellipsis;
         white-space: nowrap;
       }
-      .bubble .spinner {
+      /* Spacer pushes spinner/clock to the right edge regardless of how short
+       * the title text is. Using a flex-grow spacer keeps the spinner pinned
+       * to the right while letting the title hug its own width on the left. */
+      .bubble .spacer {
+        flex: 1 1 0;
+        min-width: 4px;        /* always at least a tiny gap before icon */
+      }
+      /* v0.4.3 — three top-right card icons (spinner / clock / check):
+       * unified position + size, only one visible at a time. Precedence
+       * (CSS rules later in the cascade win):
+       *   waiting > done > loading > none
+       * v0.4.3 fix: use absolute positioning so all three icons occupy
+       * the EXACT same pixel rect (top-right of bubble row). Otherwise
+       * spinner's border-radius hairline shifted vs check's stroke
+       * vertical center, looking misaligned when swapping. */
+      .bubble .icon-slot {
         flex: 0 0 auto;
+        position: relative;
         width: 14px;
         height: 14px;
+      }
+      .bubble .spinner,
+      .bubble .clock,
+      .bubble .check {
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 14px;
+        height: 14px;
+        opacity: 0;
+        transition: opacity 150ms ease-out;
+        box-sizing: border-box;
+      }
+      .bubble .spinner {
         border: 1.5px solid rgba(0, 0, 0, 0.15);
         border-top-color: #1a1a1a;
         border-radius: 50%;
         animation: bubble-spin 0.9s linear infinite;
-        opacity: 0;
-        transition: opacity 150ms ease-out;
       }
+      .bubble .clock { display: block; color: #999; }
+      .bubble .check { display: block; color: #34c759; }   /* iOS system green */
       .bubble.loading .spinner { opacity: 1; }
+      .bubble.done    .check   { opacity: 1; }
+      /* waiting takes precedence: clock visible, spinner & check hidden. */
+      .bubble.waiting .clock   { opacity: 1; }
+      .bubble.waiting .spinner,
+      .bubble.waiting .check   { opacity: 0; }
+      /* done takes precedence over loading: check visible, spinner hidden. */
+      .bubble.done    .spinner { opacity: 0; }
       @keyframes bubble-spin { to { transform: rotate(360deg); } }
-
-      /* v0.4.2 (2/4): clock icon — shown when broker reports
-       * waiting:true (i.e. blocked on user authorization / approval).
-       * Semantically distinct from `loading` (which means "agent is
-       * actively working"). The two are mutually exclusive at the
-       * visual layer: when .bubble.waiting is set the spinner is
-       * forced opacity:0 even if .bubble.loading is also present
-       * (later rule wins on equal specificity). JS keeps the loading
-       * class untouched and only toggles `waiting`. */
-      .bubble .clock {
-        flex: 0 0 auto;
-        width: 14px;
-        height: 14px;
-        opacity: 0;
-        transition: opacity 150ms ease-out;
-        display: block;
-      }
-      .bubble.waiting .clock { opacity: 1; }
-      .bubble.waiting .spinner { opacity: 0; }
 
       .bubble .subtitle {
         margin-top: 2px;
@@ -271,23 +290,28 @@
         <div class="bubble-row">
           <span class="badge" aria-hidden="true"></span>
           <span class="title" id="bubble-title"></span>
-          <span class="spinner" aria-hidden="true"></span>
-          <!-- Clock icon — visible iff .bubble.waiting (broker reported
-               waiting:true, i.e. blocked on user authorization). 14x14
-               viewBox; circle outline (#999, grey) + 12 o'clock hour hand
-               (#f5a623, orange — visually pops to draw attention) +
-               9 o'clock minute hand (#999, grey). Hour hand intentionally
-               shorter than the minute hand (length 2.5 vs 3.5) so the
-               icon reads as a real clock face rather than a plus sign.
-               Stroke-width 1.5 matches the spinner border weight so the
-               two icons feel equal-weight when swapping. -->
-          <svg class="clock" viewBox="0 0 14 14" width="14" height="14"
-               fill="none" stroke-width="1.5" stroke-linecap="round"
-               stroke-linejoin="round" aria-hidden="true">
-            <circle cx="7" cy="7" r="5.5" stroke="#999999" />
-            <line x1="7" y1="7" x2="7" y2="4.5" stroke="#f5a623" />
-            <line x1="7" y1="7" x2="3.5" y2="7" stroke="#999999" />
-          </svg>
+          <span class="spacer" aria-hidden="true"></span>
+          <span class="icon-slot" aria-hidden="true">
+            <span class="spinner"></span>
+            <!-- v0.4.3 — SF Symbols 'clock' style: hairline circle + 12 o'clock
+                 hour hand + 3 o'clock minute hand, all in currentColor (light
+                 grey via .bubble .clock { color: #999 }). -->
+            <svg class="clock" viewBox="0 0 14 14"
+                 fill="none" stroke="currentColor" stroke-width="1.2"
+                 stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="7" cy="7" r="5.5" />
+              <line x1="7" y1="7" x2="7" y2="3.5" />
+              <line x1="7" y1="7" x2="9.5" y2="7" />
+            </svg>
+            <!-- v0.4.3 — green check icon: shown when broker reports
+                 done:true (session.finish). iOS system green (#34c759).
+                 Same 14x14 footprint as spinner/clock. -->
+            <svg class="check" viewBox="0 0 14 14"
+                 fill="none" stroke="currentColor" stroke-width="1.8"
+                 stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="3 7.5, 6 10, 11 4.5" />
+            </svg>
+          </span>
         </div>
         <div class="subtitle" id="bubble-subtitle"></div>
       </div>
@@ -395,6 +419,8 @@
         // ensures spinner hides when waiting is on). We still leave the
         // `loading` class as-is so semantics survive a waiting→done flip.
         bubbleEl.classList.toggle('waiting', !!lastCard.waiting);
+        // v0.4.3: done = green check, takes precedence over loading.
+        bubbleEl.classList.toggle('done', !!lastCard.done);
         bubbleEl.classList.add('show');
       }
 
@@ -405,7 +431,7 @@
         bubbleTitleEl.textContent = opts.bubble;
         bubbleSubtitleEl.textContent = '';
         bubbleEl.classList.add('compact', 'show');
-        bubbleEl.classList.remove('loading', 'waiting');
+        bubbleEl.classList.remove('loading', 'waiting', 'done');
         if (bubbleHideTimer) { clearTimeout(bubbleHideTimer); bubbleHideTimer = null; }
         const ttlMs = opts.ttlMs ?? 2500;
         if (ttlMs > 0) {
@@ -427,6 +453,18 @@
       });
       // Prevent the click from also dragging the window.
       toggleEl.addEventListener('mousedown', (e) => e.stopPropagation());
+
+      // v0.4.3 — when card is in `done` state (✓ green), hovering anywhere
+      // on the card POSTs /dismiss so the broker evicts the session and
+      // the card disappears. This replaces the pre-v0.4.3 5-minute auto-
+      // evict timer (vino wanted manual dismiss). Once dismissed, broker
+      // re-broadcasts which clears lastCard → card hides via renderUi.
+      bubbleEl.addEventListener('mouseenter', () => {
+        if (!bubbleEl.classList.contains('done')) return;
+        fetch('http://127.0.0.1:7857/dismiss', { method: 'POST' }).catch(() => {
+          /* ignore — broker may be down */
+        });
+      });
 
       // ---- WS client -----------------------------------------------------
       const WS_URL = 'ws://127.0.0.1:7857/ws';
@@ -458,6 +496,7 @@
                   subtitle: msg.subtitle || '',
                   loading: !!msg.loading,
                   waiting: !!msg.waiting,
+                  done: !!msg.done,
                 };
               } else if (msg.title === '' && msg.subtitle === '' && activeCount === 0) {
                 // Explicit clear (no active session).

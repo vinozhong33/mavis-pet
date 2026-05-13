@@ -106,6 +106,14 @@ export interface WsStateMessage {
    * Mutually exclusive at the UI level (waiting takes precedence over loading).
    */
   waiting?: boolean;
+  /**
+   * v0.4.3 — show **green check icon** in card top-right.
+   * Semantically: "session finished, last assistant reply done streaming".
+   * Replaces spinner/clock at the same position. Floater shows it for a
+   * short transition window after session.finish before the card evicts.
+   * Precedence: waiting > done > loading > none.
+   */
+  done?: boolean;
   /** Auto-dismiss ms; undefined = sticky until next state push. */
   bubbleTtlMs?: number;
   /** v0.4.2 — number of active mavis sessions; drives collapsed-state badge. */

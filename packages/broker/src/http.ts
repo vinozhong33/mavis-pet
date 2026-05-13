@@ -46,6 +46,18 @@ export interface HttpDeps {
   /** Process start ts for uptime. */
   startedAt: number;
   logger?: Logger;
+  /**
+   * v0.4.3 — fired after every successfully ingested hook event. broker
+   * server.ts uses this to translate PreToolUse(tool) → live action verb
+   * on the floater card subtitle. Optional so existing tests / callers
+   * don't need to wire it up.
+   */
+  onHookEvent?: (event: HookEvent) => void;
+  /**
+   * v0.4.3 — fired when the floater POSTs /dismiss (user hover/click on
+   * a done card). broker evicts the picked session immediately + re-broadcasts.
+   */
+  onDismissCard?: () => void;
 }
 
 export function createHttpHandler(deps: HttpDeps) {
@@ -69,6 +81,15 @@ export function createHttpHandler(deps: HttpDeps) {
       }
       if (method === "POST" && url === "/switch") {
         await handleSwitch(req, res, deps);
+        return;
+      }
+      // v0.4.3 — floater calls this on hover/click of a "done" card to
+      // dismiss it (evict the session immediately + force re-broadcast so
+      // the card disappears). No body required.
+      if (method === "POST" && url === "/dismiss") {
+        deps.onDismissCard?.();
+        res.statusCode = 204;
+        res.end();
         return;
       }
       if (method === "GET" && url === "/healthz") {
@@ -160,6 +181,10 @@ async function handleEvent(
 
   deps.machine.ingest(event);
   pushRecentEvent(deps.recentEvents, event);
+  // v0.4.3 — broadcast PreToolUse → live action verb to event-source pool.
+  // Maps tool name to short Chinese verb shown in the floater card subtitle
+  // during a streaming turn (replaces the empty "no message yet" gap).
+  deps.onHookEvent?.(event);
 
   res.statusCode = 204;
   res.end();

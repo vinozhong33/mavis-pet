@@ -120,33 +120,41 @@ export interface BrokerHandle {
  * Used as fallback when no v0.4 card is configured for the state.
  * Override via {@link BrokerOptions.bubbles}.
  */
+/**
+ * v0.4.2 — legacy compact-pill copy. Deprecated; kept for `bubbles` opt
+ * override capability. Empty defaults match the cards default — we don't
+ * ship any stub copy out of the box (used to ship "oops"/"hey!"/etc which
+ * looked random to the user when they didn't trigger an actual error).
+ */
 const DEFAULT_BUBBLES: Record<PetState, string | null> = {
-  failed: "oops",
-  review: "等你 allow",
-  jump: "hey!",
-  extra1: "morning",
-  extra2: "bye",
-  wave: "done!",
+  failed: null,
+  review: null,
+  jump: null,
+  extra1: null,
+  extra2: null,
+  wave: null,
   run: null,
   idle: null,
 };
 
 /**
- * v0.4 task-card config (per state). Stub copy until the SSE module in
- * v0.4.1+ supplies real session title + latest assistant message.
+ * v0.4.2 — task-card config kept ONLY as a documentation/extension point.
+ * The default copy ("Tool failed", "Got it" etc.) was actively misleading
+ * (vino kept seeing "Tool failed" when no tool actually failed — failed
+ * state degrades from any non-zero PostToolUse exit, but the stub label
+ * suggests it's a real perm-blocking error). Keep the type for future
+ * per-state customization, but ship empty defaults so the floater shows
+ * NO card unless real SSE-driven session data is available.
  *
- * Idle and run intentionally remain `null` — they want real data, not
- * stub text. Until the SSE pipeline lands, idle/run keep going through
- * the legacy bubble path (which is also null for those two states, so
- * the floater shows nothing — same as v0.3).
+ * If you want a stub back for testing, override via {@link BrokerOptions.cards}.
  */
 const DEFAULT_CARDS: Record<PetState, CardConfig | null> = {
-  failed:  { title: "Tool failed", subtitle: "检查输出 / 查日志", loading: false },
-  review:  { title: "Permission needed", subtitle: "等你 allow", loading: true },
-  jump:    { title: "Got it", subtitle: "开始处理...", loading: true },
-  extra1:  { title: "Hello", subtitle: "新会话开始", loading: false },
-  extra2:  { title: "See ya", subtitle: "会话结束", loading: false },
-  wave:    { title: "Done", subtitle: "完成 ✓", loading: false },
+  failed:  null,
+  review:  null,
+  jump:    null,
+  extra1:  null,
+  extra2:  null,
+  wave:    null,
   run:     null,
   idle:    null,
 };
@@ -202,6 +210,15 @@ export async function startBroker(opts: BrokerOptions = {}): Promise<BrokerHandl
       clock,
       daemonUrl: opts.daemonUrl,
       logger,
+      // v0.4.3 — when SSE updates a session's title / lastMessage,
+      // re-broadcast the current state so the floater immediately picks up
+      // the new card content. Without this hook, SSE data only reaches the
+      // floater when an unrelated hook event happens to fire onChange.
+      onSessionUpdate: () => {
+        const state = machine.globalState;
+        const ts = clock.now();
+        broadcastForState(state, ts);
+      },
     });
   }
 
@@ -221,7 +238,7 @@ export async function startBroker(opts: BrokerOptions = {}): Promise<BrokerHandl
   //
   // Sticky states (review) skip the auto-dismiss TTL.
   // Every push carries `activeSessionCount` for the collapsed-state badge.
-  machine.onChange((state, ts) => {
+  function broadcastForState(state: PetState, ts: number): void {
     const activeSessionCount = machine.activeSessionCount();
     const isLoading = state === "run" || state === "jump";
     const isWaiting = state === "review";
@@ -229,12 +246,21 @@ export async function startBroker(opts: BrokerOptions = {}): Promise<BrokerHandl
 
     // 1. Try SSE-driven real session data first.
     const sess = pickActiveSession(eventSource);
-    if (sess && (sess.title || sess.lastMessage)) {
+    if (sess && (sess.title || sess.displayName || sess.lastMessage || sess.currentAction)) {
+      // v0.4.3 — title preference: real session.title > agent displayName.
+      const cardTitle = sess.title || sess.displayName || "Working...";
+      const isDone = sess.status === "finished";
+      // v0.4.3 — subtitle priority: real lastMessage (streaming or final
+      // assistant reply) > currentAction stub ("正在思考"). Show whatever
+      // assistant text we have, even mid-stream — empty string only if
+      // really nothing yet.
+      const cardSubtitle = sess.lastMessage || sess.currentAction || "";
       hub.broadcastState(state, ts, {
-        title: sess.title ?? "Working...",
-        subtitle: sess.lastMessage ?? "",
-        loading: isLoading,
+        title: cardTitle,
+        subtitle: cardSubtitle,
+        loading: isLoading && !isDone,
         waiting: isWaiting,
+        done: isDone,
         bubbleTtlMs: sticky ? undefined : bubbleTtlMs,
         activeSessionCount,
       });
@@ -281,7 +307,8 @@ export async function startBroker(opts: BrokerOptions = {}): Promise<BrokerHandl
         activeSessionCount,
       });
     }
-  });
+  }
+  machine.onChange((state, ts) => broadcastForState(state, ts));
 
   const handler = createHttpHandler({
     machine,
@@ -291,6 +318,24 @@ export async function startBroker(opts: BrokerOptions = {}): Promise<BrokerHandl
     petRef,
     startedAt,
     logger,
+    // v0.4.3 — translate PreToolUse(tool) into a short Chinese verb describing
+    // what the session is doing right now. Falls back to "正在思考" via
+    // session.start; clears on session.finish.
+    onHookEvent: (event) => {
+      if (!eventSource) return;
+      if (event.kind === "PreToolUse" && event.tool) {
+        const action = toolActionLabel(event.tool);
+        eventSource.markAction(event.sessionId, action);
+      } else if (event.kind === "MessageComplete") {
+        eventSource.markAction(event.sessionId, null);
+      }
+    },
+    // v0.4.3 — floater POST /dismiss when user hovers/clicks a done card.
+    // Evict the session immediately so the card disappears (vs the default
+    // 5min lazy evict). Also stops any polling timer for that session.
+    onDismissCard: () => {
+      if (eventSource) eventSource.dismissCurrent();
+    },
   });
 
   const { server: http, address } = await startHttpServer(handler, host, port);
@@ -376,7 +421,31 @@ function pickActiveSession(es: EventSourceHandle | null): ActiveSession | null {
   if (!es) return null;
   let best: ActiveSession | null = null;
   for (const s of es.getActiveSessions().values()) {
+    // v0.4.3 — skip sessions flagged hidden (cron-triggered etc).
+    if (s.hidden) continue;
     if (!best || s.lastTouchedAt > best.lastTouchedAt) best = s;
   }
   return best;
+}
+
+/**
+ * v0.4.3 — map a tool name to a short Chinese verb describing what the
+ * session is currently doing. Used by the broker's hook-event listener
+ * (PreToolUse) to populate the floater card subtitle during a streaming
+ * turn (replaces the empty "no message yet" gap with live status).
+ *
+ * Unknown tool → generic "调用工具中". Returning a stable Chinese label
+ * keeps the floater card from flicker-changing on every tool swap.
+ */
+function toolActionLabel(tool: string): string {
+  const t = tool.toLowerCase();
+  if (t === "bash") return "执行命令";
+  if (t === "webfetch" || t === "fetch") return "查阅资料";
+  if (t === "read") return "读取文件";
+  if (t === "write") return "编辑文件";
+  if (t === "edit") return "修改代码";
+  if (t === "grep" || t === "glob") return "搜索代码";
+  if (t === "task" || t === "spawn") return "派发任务";
+  if (t.startsWith("mavis_") || t.startsWith("mcp_")) return "调用工具";
+  return "调用工具";
 }

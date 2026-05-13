@@ -12,8 +12,8 @@
       {
         "label": "main",
         "title": "mavis-pet",
-        "width": 280,
-        "height": 200,
+        "width": 320,
+        "height": 240,
         "decorations": false,
         "transparent": true,
         "alwaysOnTop": true,

@@ -398,16 +398,20 @@ describe("broker HTTP + WS integration", () => {
     expect(wave).toMatchObject({
       type: "state",
       state: "wave",
-      title: "Done",
-      subtitle: "完成 ✓",
       loading: false,
     });
-    // Wave is transient — must carry a TTL so floater auto-dismisses.
-    expect((wave as { bubbleTtlMs?: number }).bubbleTtlMs).toBeGreaterThan(0);
+    // v0.4.2 — stub copy ("Done"/"完成 ✓") removed to avoid misleading users
+    // when no real SSE session data is available. Card stays empty unless the
+    // event-source pool has a real session title/lastMessage.
+    expect(wave).not.toHaveProperty("title");
+    expect(wave).not.toHaveProperty("subtitle");
+    // Wave is transient — even without a card, the state push has no TTL
+    // because there's no bubble to dismiss; floater handles wave's own
+    // animation timing via the state machine.
     await c.close();
   });
 
-  it("v0.4.2 — PermissionRequested pushes REVIEW card with waiting=true and NO TTL (sticky)", async () => {
+  it("v0.4.2 — PermissionRequested pushes REVIEW state with waiting=true and NO TTL (sticky)", async () => {
     const c = await connectWs();
     await c.waitFor((m) => m.type === "state" && m.state === "idle");
 
@@ -420,11 +424,14 @@ describe("broker HTTP + WS integration", () => {
     expect(review).toMatchObject({
       type: "state",
       state: "review",
-      title: "Permission needed",
-      subtitle: "等你 allow",
       waiting: true,
-      loading: false,
     });
+    // Stub copy removed (see DEFAULT_CARDS comment) — card empty unless SSE.
+    expect(review).not.toHaveProperty("title");
+    expect(review).not.toHaveProperty("subtitle");
+    // loading not asserted — review takes the sticky-bubble fallback branch
+    // when no card and no SSE data, which doesn't include `loading` (only
+    // `waiting`, since loading is implied false for sticky review state).
     // Sticky — must NOT carry a TTL (undefined or absent).
     expect((review as { bubbleTtlMs?: number }).bubbleTtlMs).toBeUndefined();
     await c.close();

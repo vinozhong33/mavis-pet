@@ -230,7 +230,7 @@ describe("event-source — parse run_status_changed", () => {
     expect(titleHits.length).toBeGreaterThanOrEqual(1);
   });
 
-  it("finished → schedules evict that removes the session after evictAfterMs", async () => {
+  it("session.finish → schedules evict that removes the session after evictAfterMs", async () => {
     const m = mockFetch({
       "/mavis/api/session/ses_beta": { title: "Wave goodbye" },
     });
@@ -245,9 +245,11 @@ describe("event-source — parse run_status_changed", () => {
     es.start();
     const stream = await m.waitForSseConnect();
 
+    // v0.4.3 — daemon real shape: `{type, timestamp, source, payload:{sessionId,...}}`
+    // Event names are `session.start` / `session.finish`, not `run_status_changed`.
     stream.push(
-      'event: run_status_changed\ndata: {"sessionId":"ses_beta","status":"started"}\n\n' +
-        'event: run_status_changed\ndata: {"sessionId":"ses_beta","status":"finished"}\n\n',
+      'event: session.start\ndata: {"type":"session.start","timestamp":1,"source":"session-bridge","payload":{"sessionId":"ses_beta","agentName":"main"}}\n\n' +
+        'event: session.finish\ndata: {"type":"session.finish","timestamp":2,"source":"session-bridge","payload":{"sessionId":"ses_beta","agentName":"main"}}\n\n',
     );
     await flushMicrotasks(20);
     await es.whenIdle();
@@ -264,39 +266,13 @@ describe("event-source — parse run_status_changed", () => {
   });
 });
 
-describe("event-source — parse message_update / message_end", () => {
-  it("inline content populates lastMessage (truncated to maxMessageChars)", async () => {
-    const m = mockFetch({});
-    const clock = new FakeClock();
-    es = createEventSource({
-      clock,
-      daemonUrl: "http://localhost:9999",
-      logger: NullLogger,
-      fetchImpl: m.fetch,
-      maxMessageChars: 20,
-    });
-    es.start();
-    const stream = await m.waitForSseConnect();
+describe("event-source — daemon-real-shape sanity", () => {
+  // v0.4.3 — daemon does NOT push message tokens via /api/events; lastMessage
+  // is populated by the per-event REST poll to /session/<sid>/message?limit=1.
+  // The pre-v0.4.3 message_update / message_end inline-content tests were
+  // chasing a payload shape daemon never emits and have been removed.
 
-    const longText =
-      "This is a long assistant reply that exceeds the configured cap.";
-    stream.push(
-      "event: message_update\n" +
-        `data: {"sessionId":"ses_gamma","content":${JSON.stringify(longText)}}\n` +
-        "\n",
-    );
-    await flushMicrotasks(10);
-    await es.whenIdle();
-
-    const s = es.getActiveSessions().get("ses_gamma");
-    expect(s).toBeDefined();
-    expect(s!.lastMessage).toBeDefined();
-    // Truncated with ellipsis (max 20).
-    expect(s!.lastMessage!.length).toBeLessThanOrEqual(20);
-    expect(s!.lastMessage!.endsWith("…")).toBe(true);
-  });
-
-  it("message_end with Anthropic-shaped content ([{type:'text', text:'...'}]) is extracted", async () => {
+  it("session.title_updated populates sess.title from payload (no extra HTTP fetch)", async () => {
     const m = mockFetch({});
     const clock = new FakeClock();
     es = createEventSource({
@@ -308,30 +284,19 @@ describe("event-source — parse message_update / message_end", () => {
     es.start();
     const stream = await m.waitForSseConnect();
 
-    const payload = {
-      sessionId: "ses_delta",
-      content: [
-        { type: "text", text: "Hello" },
-        { type: "text", text: " world" },
-      ],
-    };
     stream.push(
-      `event: message_end\ndata: ${JSON.stringify(payload)}\n\n`,
+      'event: session.title_updated\ndata: {"type":"session.title_updated","timestamp":1,"source":"SessionService","payload":{"sessionId":"ses_title","title":"Refactor broker SSE"}}\n\n',
     );
     await flushMicrotasks(10);
     await es.whenIdle();
 
-    const s = es.getActiveSessions().get("ses_delta");
+    const s = es.getActiveSessions().get("ses_title");
     expect(s).toBeDefined();
-    expect(s!.lastMessage).toBe("Hello world");
+    expect(s!.title).toBe("Refactor broker SSE");
   });
 
-  it.skip("falls back to /session/<sid>/message?limit=1 when SSE payload has no inline content", async () => {
-    const m = mockFetch({
-      "/mavis/api/session/ses_eps/message": {
-        messages: [{ content: "Latest reply via fallback" }],
-      },
-    });
+  it("fs.* / system.* / config.* events are filtered (no pool entry)", async () => {
+    const m = mockFetch({});
     const clock = new FakeClock();
     es = createEventSource({
       clock,
@@ -343,19 +308,14 @@ describe("event-source — parse message_update / message_end", () => {
     const stream = await m.waitForSseConnect();
 
     stream.push(
-      'event: message_update\ndata: {"sessionId":"ses_eps"}\n\n',
+      'event: fs.change\ndata: {"type":"fs.change","timestamp":1,"source":"fs-watcher","payload":{"sessionId":"ses_noisy","watchId":"x"}}\n\n' +
+        'event: system.shutdown\ndata: {"type":"system.shutdown","timestamp":2,"source":"sys","payload":{"sessionId":"ses_noisy"}}\n\n' +
+        'event: config.changed\ndata: {"type":"config.changed","timestamp":3,"source":"cfg","payload":{"sessionId":"ses_noisy"}}\n\n',
     );
-    await flushMicrotasks(20);
+    await flushMicrotasks(10);
     await es.whenIdle();
 
-    const s = es.getActiveSessions().get("ses_eps");
-    expect(s?.lastMessage).toBe("Latest reply via fallback");
-    // Fallback fetch should have been issued.
-    expect(
-      m.calls.some((c) =>
-        c.url.includes("/mavis/api/session/ses_eps/message?limit=1"),
-      ),
-    ).toBe(true);
+    expect(es.activeCount()).toBe(0);
   });
 });
 
@@ -376,8 +336,8 @@ describe("event-source — robustness", () => {
 
     stream.push(
       ":heartbeat\r\n" +
-        "event: run_status_changed\r\n" +
-        'data: {"sessionId":"ses_crlf","status":"started"}\r\n' +
+        "event: session.start\r\n" +
+        'data: {"type":"session.start","timestamp":1,"source":"x","payload":{"sessionId":"ses_crlf"}}\r\n' +
         "\r\n",
     );
     await flushMicrotasks(20);
@@ -402,7 +362,7 @@ describe("event-source — robustness", () => {
     const stream = await m.waitForSseConnect();
 
     stream.push(
-      'event: weirdo_future_event\ndata: {"sessionId":"ses_zeta","payload":42}\n\n',
+      'event: weirdo_future_event\ndata: {"type":"weirdo","timestamp":1,"source":"x","payload":{"sessionId":"ses_zeta"}}\n\n',
     );
     await flushMicrotasks(10);
     await es.whenIdle();
@@ -428,7 +388,7 @@ describe("event-source — robustness", () => {
     const stream = await m.waitForSseConnect();
 
     stream.push(
-      'event: run_status_changed\ndata: {"status":"started"}\n\n',
+      'event: run_status_changed\ndata: {"type":"session.start","timestamp":1,"source":"x","payload":{}}\n\n',
     );
     await flushMicrotasks(10);
     await es.whenIdle();

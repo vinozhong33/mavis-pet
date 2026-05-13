@@ -47,6 +47,13 @@ export interface ActiveSession {
   sessionId: string;
   /** Cached from `/mavis/api/session/<sid>` after first 'started' event. */
   title?: string;
+  /**
+   * v0.4.3 — Cached agent display name from `/mavis/api/session/<sid>`
+   * (`displayName` field, fallback to `agentName`). Used as fallback when
+   * `title` is empty (e.g. agent root session that hasn't been named by
+   * the LLM yet — surface "mavis健康" instead of empty title).
+   */
+  displayName?: string;
   /** Cached from `/mavis/api/session/<sid>/message?limit=1` (≤ 80 chars). */
   lastMessage?: string;
   /** Last known SSE status: 'started' | 'finished' | other (raw). */
@@ -55,6 +62,27 @@ export interface ActiveSession {
   lastTouchedAt: number;
   /** When non-null, an evict timer scheduled for this session. */
   evictTimer?: TimerHandle | null;
+  /**
+   * v0.4.3 — true for cron-triggered sessions (purpose starts with 'cron:').
+   * The floater hides these from the task card; vino only cares about
+   * sessions they themselves prompted.
+   */
+  hidden?: boolean;
+  /**
+   * v0.4.3 — short Chinese verb describing what the session is currently
+   * doing during a streaming turn. Updated by the broker when it observes
+   * PreToolUse hook events ("执行命令" for bash, "搜索代码" for grep, etc.).
+   * Cleared on session.finish so the card switches to the real lastMessage.
+   * When set, the floater shows this string as subtitle instead of
+   * lastMessage — semantically "live status" vs "final reply preview".
+   */
+  currentAction?: string;
+  /**
+   * v0.4.3 — interval handle for the lastMessage poller running while
+   * status === "started". Polls daemon every 1.5s so the floater card
+   * subtitle reflects live streaming output. Cleared on session.finish.
+   */
+  pollTimer?: TimerHandle | null;
 }
 
 export interface EventSourceOptions {
@@ -79,6 +107,13 @@ export interface EventSourceOptions {
   maxBackoffMs?: number;
   /** Max chars for `lastMessage` (truncated). Default 80. */
   maxMessageChars?: number;
+  /**
+   * v0.4.3 — fired whenever a session's title / lastMessage / status changes.
+   * broker uses this to push a fresh WS state message even when the broker
+   * state machine itself didn't transition (SSE is a side channel that
+   * doesn't go through hook events). Pass null to disable (e.g. tests).
+   */
+  onSessionUpdate?: () => void;
 }
 
 export interface EventSourceHandle {
@@ -90,6 +125,19 @@ export interface EventSourceHandle {
   getActiveSessions(): Map<string, ActiveSession>;
   /** Number of currently tracked sessions (cheap accessor). */
   activeCount(): number;
+  /**
+   * v0.4.3 — set live action description for a session. Called by broker
+   * server.ts when it observes hook events (PreToolUse → tool name verb).
+   * If session not in pool yet, pre-creates an entry. Triggers
+   * onSessionUpdate so the floater immediately re-broadcasts.
+   */
+  markAction(sid: string, action: string | null): void;
+  /**
+   * v0.4.3 — explicitly evict the session whose card the user just dismissed
+   * (POST /dismiss from floater). Pass null to evict the most-recently-touched
+   * non-hidden session (the one currently shown in the card).
+   */
+  dismissCurrent(): void;
   /**
    * Test/diagnostic hook — resolves once every in-flight event handler
    * (including its inner fetch chain to `/session/<sid>` and
@@ -108,10 +156,15 @@ export function createEventSource(opts: EventSourceOptions): EventSourceHandle {
   const eventsUrl = `${baseUrl}/mavis/api/events`;
   const fetchImpl = opts.fetchImpl ?? fetch;
   const log = opts.logger;
-  const evictAfterMs = opts.evictAfterMs ?? 5 * 60 * 1000;
+  // v0.4.3 — default 0 disables auto-eviction. Done cards stick around
+  // until the user explicitly dismisses (floater POST /dismiss on hover).
+  // Tests / advanced configs can pass a positive ms to opt back into the
+  // pre-v0.4.3 5-minute auto-evict behavior.
+  const evictAfterMs = opts.evictAfterMs ?? 0;
   const initialBackoffMs = opts.initialBackoffMs ?? 500;
   const maxBackoffMs = opts.maxBackoffMs ?? 30_000;
   const maxMessageChars = opts.maxMessageChars ?? 80;
+  const onSessionUpdate = opts.onSessionUpdate;
 
   const sessions = new Map<string, ActiveSession>();
   let started = false;
@@ -126,12 +179,27 @@ export function createEventSource(opts: EventSourceOptions): EventSourceHandle {
   // Daemon HTTP fetch helpers — fetch session info / latest message.
   // -------------------------------------------------------------------------
 
-  async function fetchSessionTitle(sid: string): Promise<string | undefined> {
+  async function fetchSessionTitle(sid: string): Promise<{ title?: string; displayName?: string } | undefined> {
     try {
       const r = await fetchImpl(`${baseUrl}/mavis/api/session/${sid}`);
       if (!r.ok) return undefined;
-      const j = (await r.json()) as { title?: unknown };
-      if (typeof j?.title === "string" && j.title.trim()) return j.title.trim();
+      const j = (await r.json()) as { session?: { title?: unknown; displayName?: unknown; agentName?: unknown } };
+      // v0.4.3 — daemon wraps result in `{session: {...}}` envelope.
+      const sess = j?.session ?? (j as unknown as { title?: unknown; displayName?: unknown; agentName?: unknown });
+      const out: { title?: string; displayName?: string } = {};
+      if (sess && typeof sess === "object") {
+        const t = (sess as { title?: unknown }).title;
+        if (typeof t === "string" && t.trim()) out.title = t.trim();
+        const d = (sess as { displayName?: unknown }).displayName;
+        if (typeof d === "string" && d.trim()) {
+          out.displayName = d.trim();
+        } else {
+          // Fallback to agentName (raw agent id) if no displayName.
+          const a = (sess as { agentName?: unknown }).agentName;
+          if (typeof a === "string" && a.trim()) out.displayName = a.trim();
+        }
+      }
+      return Object.keys(out).length ? out : undefined;
     } catch (err) {
       log?.debug("event_source_fetch_session_failed", {
         sid,
@@ -143,25 +211,36 @@ export function createEventSource(opts: EventSourceOptions): EventSourceHandle {
 
   async function fetchLatestMessage(sid: string): Promise<string | undefined> {
     try {
+      // v0.4.3 — pull a small batch (5) and pick the most-recent
+      // ASSISTANT message that has actual text content. We can't ask for
+      // limit=1 because the most-recent is often a tool_call (msg_type=2,
+      // tool_calls only, no text) or a user message — both have nothing
+      // to show. The daemon real schema is `{role, msg_type, msg_content,
+      // tool_calls, timestamp, ...}`; assistant msg_type=1 is pure text,
+      // msg_type=2 may be tool_call with optional msg_content commentary.
       const r = await fetchImpl(
-        `${baseUrl}/mavis/api/session/${sid}/message?limit=1`,
+        `${baseUrl}/mavis/api/session/${sid}/message?limit=5`,
       );
       if (!r.ok) return undefined;
-      const j = (await r.json()) as
-        | { messages?: unknown }
-        | { message?: unknown }
-        | unknown[];
-      // Accept several shapes defensively.
-      let msg: unknown;
-      if (Array.isArray(j)) {
-        msg = j[0];
-      } else if (j && typeof j === "object") {
-        const o = j as { messages?: unknown[]; message?: unknown };
-        msg = (Array.isArray(o.messages) && o.messages[0]) || o.message;
+      const j = (await r.json()) as { messages?: unknown[] };
+      const msgs = Array.isArray(j?.messages) ? j.messages : [];
+      // Daemon returns messages in reverse-chronological order (newest first
+      // in some endpoints, oldest first in others). Sort by timestamp desc
+      // defensively, then pick first assistant with msg_content.
+      type Row = {
+        role?: string;
+        msg_content?: string;
+        timestamp?: number;
+      };
+      const sorted = (msgs as Row[])
+        .filter((m) => m && typeof m === "object")
+        .sort((a, b) => (b.timestamp ?? 0) - (a.timestamp ?? 0));
+      for (const m of sorted) {
+        if (m.role !== "assistant") continue;
+        if (typeof m.msg_content === "string" && m.msg_content.trim()) {
+          return truncate(m.msg_content, maxMessageChars);
+        }
       }
-      const content = extractMessageContent(msg);
-      if (!content) return undefined;
-      return truncate(content, maxMessageChars);
     } catch (err) {
       log?.debug("event_source_fetch_message_failed", {
         sid,
@@ -176,6 +255,19 @@ export function createEventSource(opts: EventSourceOptions): EventSourceHandle {
   // -------------------------------------------------------------------------
 
   async function handleEvent(name: string, data: unknown): Promise<void> {
+    // v0.4.3 — filter high-frequency noise events that have no per-session
+    // semantics (would inflate sessions Map + spam logs). Daemon emits
+    // fs.change for every workspace file mutation, system.* / config.* etc.
+    // Heartbeats are stripped by the SSE reader before reaching here.
+    if (
+      name.startsWith("fs.") ||
+      name.startsWith("system.") ||
+      name.startsWith("config.") ||
+      name === "heartbeat"
+    ) {
+      return;
+    }
+
     const sid = extractSessionId(data);
     if (!sid) {
       log?.debug("event_source_event_no_sid", { name });
@@ -183,54 +275,105 @@ export function createEventSource(opts: EventSourceOptions): EventSourceHandle {
     }
     const now = opts.clock.now();
     const sess = ensureSession(sid, now);
+    sess.lastTouchedAt = now;
 
     switch (name) {
-      case "run_status_changed": {
-        const status = extractField(data, "status");
-        sess.status = typeof status === "string" ? status : sess.status;
-        sess.lastTouchedAt = now;
-        if (sess.status === "started") {
-          // Cancel any pending evict (re-started after finishing).
-          cancelEvict(sess);
-          // Lazily fetch title once; further started events keep cached value.
-          if (!sess.title) {
-            const title = await fetchSessionTitle(sid);
-            if (title) sess.title = title;
-          }
-        } else if (sess.status === "finished") {
-          // Schedule evict — keep around so the "done" card lingers briefly.
-          scheduleEvict(sess);
+      // Daemon emits these (verified via 60s SSE tap on real daemon, see
+      // v0.4.3 schema investigation). The pre-v0.4.3 broker listened for
+      // `run_status_changed` / `message_update` / `message_end` /
+      // `session.new` — NONE of those exist on /api/events.
+      case "session.created": {
+        // v0.4.3 — flag cron-triggered sessions as hidden so they don't surface
+        // on the floater card. Daemon payload has `purpose: "cron:<agent>:<name>"`
+        // for cron-spawned sessions; user-prompted sessions either omit it or
+        // use a non-cron purpose string.
+        const payload =
+          (data && typeof data === "object" && (data as { payload?: unknown }).payload) || {};
+        const purpose =
+          payload && typeof payload === "object"
+            ? (payload as { purpose?: unknown }).purpose
+            : undefined;
+        if (typeof purpose === "string" && purpose.startsWith("cron:")) {
+          sess.hidden = true;
         }
+        // New session — fetch title (might still be undefined; another
+        // session.title_updated will follow once the LLM names it). Also
+        // fetches displayName for fallback when title is empty.
+        if (!sess.title || !sess.displayName) {
+          const info = await fetchSessionTitle(sid);
+          if (info?.title && !sess.title) sess.title = info.title;
+          if (info?.displayName && !sess.displayName) sess.displayName = info.displayName;
+        }
+        // Pull initial latest message (might be empty for fresh session).
+        const fetched = await fetchLatestMessage(sid);
+        if (fetched) sess.lastMessage = fetched;
         break;
       }
-      case "message_update":
-      case "message_end": {
-        sess.lastTouchedAt = now;
-        // Try inline content first; fall back to fetching latest message.
-        const inline = extractMessageContent(data);
-        if (inline) {
-          sess.lastMessage = truncate(inline, maxMessageChars);
-        } else {
-          const fetched = await fetchLatestMessage(sid);
-          if (fetched) sess.lastMessage = fetched;
+      case "session.start": {
+        // Turn started — equivalent to old run_status_changed:started.
+        sess.status = "started";
+        // v0.4.3 — reset live status to "thinking" for the new turn.
+        // PreToolUse will overwrite with a more specific verb if a tool fires.
+        sess.currentAction = "正在思考";
+        cancelEvict(sess);
+        if (!sess.title || !sess.displayName) {
+          const info = await fetchSessionTitle(sid);
+          if (info?.title && !sess.title) sess.title = info.title;
+          if (info?.displayName && !sess.displayName) sess.displayName = info.displayName;
         }
+        // v0.4.3 — start 1.5s polling for live lastMessage updates so the
+        // floater card subtitle reflects the streaming reply chunk-by-chunk
+        // (daemon doesn't push tokens via /api/events).
+        startMessagePolling(sess);
+        // Refresh lastMessage on every turn-start (user probably just sent
+        // a new prompt; we'll get the assistant reply via subsequent polls).
+        const fetched = await fetchLatestMessage(sid);
+        if (fetched) sess.lastMessage = fetched;
         break;
       }
-      case "session.new": {
-        sess.lastTouchedAt = now;
-        // session.new does not always carry a title; fetch it.
-        if (!sess.title) {
-          const title = await fetchSessionTitle(sid);
-          if (title) sess.title = title;
-        }
+      case "session.finish": {
+        // Turn ended — equivalent to old run_status_changed:finished.
+        sess.status = "finished";
+        // v0.4.3 — clear live action so subtitle falls back to real lastMessage.
+        sess.currentAction = undefined;
+        // Stop polling — final message will be fetched once below.
+        stopMessagePolling(sess);
+        // Final pull of latest message (the just-completed assistant reply).
+        const fetched = await fetchLatestMessage(sid);
+        if (fetched) sess.lastMessage = fetched;
+        scheduleEvict(sess);
+        break;
+      }
+      case "session.title_updated": {
+        // Title changed (LLM auto-name or user rename) — pull from payload
+        // so we don't need an extra HTTP round-trip.
+        const t = extractTitleFromPayload(data);
+        if (t) sess.title = t;
+        break;
+      }
+      case "session.compressed":
+      case "session.deleted":
+      case "session.abort": {
+        // Drop session immediately; no longer interesting to surface.
+        sessions.delete(sid);
         break;
       }
       default: {
-        // Unknown event: log + leave the session record in place (lastTouchedAt
-        // updates so it doesn't look idle).
-        sess.lastTouchedAt = now;
+        // Unknown event but has a sessionId: keep tracking + log.
         log?.debug("event_source_unknown_event", { name });
       }
+    }
+
+    // v0.4.3 — notify broker that this session's data may have changed,
+    // so it can re-broadcast a WS state message with the latest title /
+    // lastMessage. Without this, SSE updates only surface to the floater
+    // when a hook event happens to fire onChange.
+    try {
+      onSessionUpdate?.();
+    } catch (err) {
+      log?.warn("event_source_on_session_update_error", {
+        err: (err as Error).message,
+      });
     }
   }
 
@@ -245,6 +388,8 @@ export function createEventSource(opts: EventSourceOptions): EventSourceHandle {
 
   function scheduleEvict(s: ActiveSession): void {
     cancelEvict(s);
+    // v0.4.3 — opt-out: 0 means "don't auto-evict, wait for user dismiss".
+    if (evictAfterMs <= 0) return;
     s.evictTimer = opts.clock.setTimeout(() => {
       sessions.delete(s.sessionId);
     }, evictAfterMs);
@@ -254,6 +399,55 @@ export function createEventSource(opts: EventSourceOptions): EventSourceHandle {
     if (s.evictTimer) {
       opts.clock.clearTimeout(s.evictTimer);
       s.evictTimer = null;
+    }
+  }
+
+  /**
+   * v0.4.3 — start a 1.5s polling loop that re-fetches the latest assistant
+   * message for a `started` session. The mavis daemon does NOT push token
+   * stream over /api/events (that's only on the per-session POST response),
+   * so we have to pull. Polling stops automatically on session.finish or
+   * eviction. Idempotent — calling with a session that already has a poller
+   * is a no-op.
+   */
+  function startMessagePolling(s: ActiveSession): void {
+    if (s.pollTimer) return;
+    const tick = async () => {
+      // If session moved on (finished / evicted), stop.
+      if (s.status !== "started" || !sessions.has(s.sessionId)) {
+        s.pollTimer = null;
+        return;
+      }
+      try {
+        const fetched = await fetchLatestMessage(s.sessionId);
+        if (fetched && fetched !== s.lastMessage) {
+          s.lastMessage = fetched;
+          s.lastTouchedAt = opts.clock.now();
+          try {
+            onSessionUpdate?.();
+          } catch {
+            /* ignore */
+          }
+        }
+      } catch {
+        /* ignore poll error — next tick will retry */
+      }
+      // Recurse via setTimeout (Clock interface has no setInterval; this
+      // also makes each poll wait for the previous fetch to finish).
+      if (s.status === "started" && sessions.has(s.sessionId)) {
+        s.pollTimer = opts.clock.setTimeout(() => void tick(), 1500);
+      } else {
+        s.pollTimer = null;
+      }
+    };
+    // Kick off immediately too — don't wait 1.5s for the first one.
+    s.pollTimer = opts.clock.setTimeout(() => void tick(), 0);
+  }
+
+  function stopMessagePolling(s: ActiveSession): void {
+    if (s.pollTimer) {
+      opts.clock.clearTimeout(s.pollTimer);
+      s.pollTimer = null;
     }
   }
 
@@ -439,6 +633,48 @@ export function createEventSource(opts: EventSourceOptions): EventSourceHandle {
     activeCount() {
       return sessions.size;
     },
+    markAction(sid, action) {
+      // v0.4.3 — broker calls this on PreToolUse hook events to update the
+      // live status (e.g. "执行命令" for bash, "搜索代码" for grep). May be
+      // called for sessions not yet in pool (e.g. before session.start
+      // arrives) — in that case create a stub entry so we don't lose the
+      // action when SSE catches up.
+      const now = opts.clock.now();
+      let s = sessions.get(sid);
+      if (!s) {
+        s = ensureSession(sid, now);
+      }
+      if (action === null || action === "") {
+        s.currentAction = undefined;
+      } else {
+        s.currentAction = action;
+      }
+      s.lastTouchedAt = now;
+      try {
+        onSessionUpdate?.();
+      } catch {
+        /* ignore */
+      }
+    },
+    dismissCurrent() {
+      // Pick the most-recently-touched non-hidden session and evict it.
+      // Used by floater hover-on-done card to clear the displayed entry.
+      let best: ActiveSession | null = null;
+      for (const s of sessions.values()) {
+        if (s.hidden) continue;
+        if (!best || s.lastTouchedAt > best.lastTouchedAt) best = s;
+      }
+      if (best) {
+        cancelEvict(best);
+        stopMessagePolling(best);
+        sessions.delete(best.sessionId);
+        try {
+          onSessionUpdate?.();
+        } catch {
+          /* ignore */
+        }
+      }
+    },
     async whenIdle() {
       // Drain in waves — each handler may schedule another inner await chain
       // (fetch + json), so we re-snapshot until the set stays empty across
@@ -459,12 +695,44 @@ function extractField(data: unknown, key: string): unknown {
   return (data as Record<string, unknown>)[key];
 }
 
+/**
+ * Extract sessionId from a daemon SSE event.
+ *
+ * Daemon uses a standardized envelope `{type, timestamp, source, payload}`
+ * (see `EventBus.emit` in daemon.js). All session-related fields live under
+ * `data.payload.*`. We try `data.payload.sessionId` FIRST (the real shape),
+ * then fall back to flat `data.sessionId` etc. for forward-compat with any
+ * future event types that might inline fields.
+ */
 function extractSessionId(data: unknown): string | undefined {
-  // Accept several common spellings: sessionId, session_id, sid.
-  const candidates = ["sessionId", "session_id", "sid"];
-  for (const k of candidates) {
+  // Daemon real shape: data.payload.sessionId
+  if (data && typeof data === "object") {
+    const payload = (data as { payload?: unknown }).payload;
+    if (payload && typeof payload === "object") {
+      for (const k of ["sessionId", "session_id", "sid"]) {
+        const v = (payload as Record<string, unknown>)[k];
+        if (typeof v === "string" && v) return v;
+      }
+    }
+  }
+  // Fallback: flat (defensive — never observed but keep for forward-compat).
+  for (const k of ["sessionId", "session_id", "sid"]) {
     const v = extractField(data, k);
     if (typeof v === "string" && v) return v;
+  }
+  return undefined;
+}
+
+/**
+ * Extract a string title from a daemon SSE event payload.
+ * Used by `session.title_updated` to set sess.title without an extra HTTP fetch.
+ */
+function extractTitleFromPayload(data: unknown): string | undefined {
+  if (!data || typeof data !== "object") return undefined;
+  const payload = (data as { payload?: unknown }).payload;
+  if (payload && typeof payload === "object") {
+    const t = (payload as { title?: unknown }).title;
+    if (typeof t === "string" && t.trim()) return t.trim();
   }
   return undefined;
 }
