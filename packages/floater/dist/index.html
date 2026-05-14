@@ -183,8 +183,18 @@
         overflow: hidden;
         text-overflow: ellipsis;
         word-break: break-word;
+        /* v0.7.4 — default 1 line. No min-height so short replies sit
+         * tight without empty padding (vino: "默认两行高有点丑"). */
       }
-      .card-subtitle:empty { display: none; margin: 0; }
+      /* v0.7.4 — sticky 2-line lock. Once a card's subtitle has rendered
+       * 2 lines tall (measured via JS in updateCard), the card gets this
+       * class and the subtitle reserves a 2-line min-height permanently
+       * — even if subsequent streaming_text ticks shrink the tail back to
+       * 1 line. Kills jitter without forcing every card to start 2 lines. */
+      .card.subtitle-2lines-locked .card-subtitle {
+        min-height: 2.7em;
+      }
+      .card-subtitle:empty { display: none; margin: 0; min-height: 0; }
 
       @media (prefers-color-scheme: dark) {
         .card { background: #ffffff; color: #1a1a1a; }
@@ -384,11 +394,30 @@
       }
 
       // v0.6.1 — build a single card's DOM. Returns HTMLDivElement.
+      // v0.7.4 — Once a card's subtitle wraps to 2 lines, lock the card
+      // height at 2 lines via the .subtitle-2lines-locked class. After
+      // that, subsequent streaming_text ticks that shrink the tail back
+      // to 1 line still display in a 2-line box (lower half blank), so
+      // the card stops bouncing between 1- and 2-line height as the tail
+      // window slides over mixed CN/EN content. Call AFTER the element
+      // is in the DOM (buildCard pre-append measure would mis-read 0).
+      // vino: "默认两行高有点丑，要不上个策略，默认一行，气泡跳到两行
+      // 时，就不再恢复到一行的状态了？"
+      function maybeLockSubtitleHeight(cardEl, subEl) {
+        // Skip if already locked (cheap early exit, no measure needed).
+        if (cardEl.classList.contains('subtitle-2lines-locked')) return;
+        requestAnimationFrame(() => {
+          const lineH = parseFloat(getComputedStyle(subEl).lineHeight);
+          if (Number.isFinite(lineH) && subEl.scrollHeight > lineH * 1.5) {
+            cardEl.classList.add('subtitle-2lines-locked');
+          }
+        });
+      }
+
       function buildCard(card) {
         const root = document.createElement('div');
         root.className = 'card';
         root.dataset.sid = card.sessionId;
-
         const row = document.createElement('div');
         row.className = 'card-row';
 
@@ -454,6 +483,12 @@
           });
         });
 
+        // v0.7.4 — schedule a height-lock measure once this element gets
+        // appended to the DOM (renderCards does that immediately after).
+        // Safe to call now: rAF runs after the next layout, by which time
+        // appendChild + .show transition have committed.
+        maybeLockSubtitleHeight(root, sub);
+
         return root;
       }
 
@@ -483,9 +518,15 @@
         // actually drive the DOM: id, status, currentAction, lastMessage,
         // title, agentName. Exclude lastEventTs (it changes constantly but
         // doesn't change rendering).
+        // v0.7.4 — also include `collapsed`. The toggle button flips
+        // `collapsed` then calls renderCards(); without collapsed in the
+        // key, the dirty-check below short-circuits and the collapse-state
+        // plumbing further down (lines ~570) never runs. vino reported
+        // "点角标没法收起对话了" when broker hadn't pushed a sessions
+        // update for 30s+ (post message_complete idle window).
         const renderKey = ordered.map(c =>
           `${c.sessionId}|${c.status || ''}|${c.currentAction || ''}|${c.title || ''}|${c.agentName || ''}|${c.lastMessage || ''}`
-        ).join('||');
+        ).join('||') + '||collapsed=' + (collapsed ? '1' : '0');
         if (renderKey === lastRenderKey) return;
         lastRenderKey = renderKey;
 
@@ -586,6 +627,11 @@
         // (Click handler closes over the original card object passed to
         // buildCard, so we mutate-in-place via a side store on the element.)
         el._card = card;
+
+        // v0.7.4 — re-measure subtitle every update; if it just crossed
+        // the 2-line threshold, lock the card so future ticks can't
+        // shrink the box back to 1 line. No-op if already locked.
+        maybeLockSubtitleHeight(el, subEl);
       }
 
       // Wire the toggle button.
