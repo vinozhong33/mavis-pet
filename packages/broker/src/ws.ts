@@ -13,13 +13,24 @@ import type { WebSocket, WebSocketServer } from "ws";
 import { type Logger, NullLogger } from "./logger.js";
 import type { Broadcaster } from "./http.js";
 import type { Clock } from "./clock.js";
-import type { PetState, WsOutMessage } from "./types.js";
+import type {
+  PetState,
+  SessionCard,
+  WsOutMessage,
+  WsStateMessage,
+} from "./types.js";
 
 export interface WsHubDeps {
   /** State source — used to send initial snapshot to new clients. */
   getCurrentState(): { state: PetState; ts: number };
   /** Active pet slug, sent on connect if non-null. */
   getCurrentPet(): string | null;
+  /**
+   * v0.6.1 — current SessionCard[] snapshot, sent on connect so floaters
+   * don't have to wait for the next event to render the card stack.
+   * Optional for back-compat with tests / pre-v0.6.1 callers.
+   */
+  getCurrentSessions?(): SessionCard[];
   clock: Clock;
   logger?: Logger;
 }
@@ -59,6 +70,15 @@ export class WsHub implements Broadcaster {
     if (pet) {
       this.send(ws, { type: "pet", slug: pet });
     }
+
+    // v0.6.1 — push current SessionCard snapshot so newly-attached floaters
+    // render the card stack immediately rather than waiting for the next
+    // SSE event. Skip when the deps don't expose getCurrentSessions
+    // (back-compat with tests / pre-v0.6.1 callers).
+    if (this.deps.getCurrentSessions) {
+      const sessions = this.deps.getCurrentSessions();
+      this.send(ws, { type: "sessions", sessions });
+    }
   }
 
   /**
@@ -82,7 +102,7 @@ export class WsHub implements Broadcaster {
       activeSessionCount?: number;
     },
   ): void {
-    const msg: WsOutMessage = { type: "state", state, ts };
+    const msg: WsStateMessage = { type: "state", state, ts };
     if (opts?.bubble) msg.bubble = opts.bubble;
     if (opts?.title) msg.title = opts.title;
     if (opts?.subtitle) msg.subtitle = opts.subtitle;
@@ -98,6 +118,15 @@ export class WsHub implements Broadcaster {
 
   broadcastPet(slug: string): void {
     this.broadcast({ type: "pet", slug });
+  }
+
+  /**
+   * v0.6.1 — broadcast the full SessionCard[] snapshot. Floater replaces
+   * its current card stack with this list (idempotent — empty array means
+   * "no active sessions, hide all cards").
+   */
+  broadcastSessions(sessions: SessionCard[]): void {
+    this.broadcast({ type: "sessions", sessions });
   }
 
   clientCount(): number {

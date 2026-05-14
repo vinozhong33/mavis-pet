@@ -25,27 +25,152 @@
          * top-right corner of the pet sprite), which means part of it
          * extends OUTSIDE .pet-host on the top and right. With
          * overflow:hidden the chevron gets clipped to nothing.
-         * Sprite frame越界 was the original reason this was hidden;
-         * v0.4.1's `steps(5, jump-none)` + `to: -4*W` keeps sprite
-         * background-position within bounds, so we no longer need the
-         * outer clip. */
+         * v0.6.1 — also needed by the cards-stack for overlapping shadow
+         * and fade-out animations that briefly extend past their bounds. */
         overflow: visible;
+        /* v0.6.1 layout swap:
+         *   row 1 = cards stack (top → grows up)
+         *   row 2 = pet sprite + toggle (bottom-right anchor)
+         *
+         * Vino's spec: cards stack ABOVE the pet, not below.
+         * grid-template-rows: cards row stretches to fill, pet row hugs content.
+         * align-items: end keeps cards anchored to bottom (closest to pet),
+         * additional cards push UP — which is what we want when adding new
+         * sessions (newest pushes existing cards higher).
+         */
         display: grid;
-        grid-template-rows: auto 1fr;
-        gap: 8px;
+        grid-template-rows: 1fr auto;
+        gap: 6px;
         padding: 4px 8px 8px 8px;
         box-sizing: border-box;
       }
 
-      /* ---- v0.4.2 layout: boba TOP-RIGHT, card RIGHT BELOW (replaces v0.4 left/right split) ---- */
+      /* ---- v0.6.1 cards stack (row 1) ---- */
+      .cards-stack {
+        align-self: end;
+        justify-self: end;
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        max-width: 320px;     /* hard cap — long titles never push out */
+        width: max-content;
+        max-height: 100%;
+        overflow: visible;
+        pointer-events: auto;
+      }
+
+      /* Each individual session card. Renders agentName/title (bold one
+       * line) + currentAction OR lastMessage (subtle two-line clamp). */
+      .card {
+        background: #ffffff;
+        color: #1a1a1a;
+        border: 1px solid rgba(0, 0, 0, 0.08);
+        border-radius: 12px;
+        box-shadow:
+          0 1px 2px rgba(0, 0, 0, 0.06),
+          0 2px 8px rgba(0, 0, 0, 0.05);
+        padding: 8px 10px 9px 10px;
+        font-size: 13px;
+        line-height: 1.3;
+        cursor: pointer;
+        opacity: 0;
+        transform: translateY(4px);
+        transition: opacity 300ms ease-out, transform 300ms ease-out;
+        max-width: 320px;
+        box-sizing: border-box;
+        pointer-events: auto;
+      }
+      .card.show {
+        opacity: 1;
+        transform: translateY(0);
+      }
+      /* Removal animation — apply .leaving briefly before unmount. */
+      .card.leaving {
+        opacity: 0;
+        transform: translateY(-4px);
+      }
+      .card:hover {
+        background: #f8fafd;
+        border-color: rgba(0, 0, 0, 0.12);
+      }
+      .card.finished {
+        opacity: 0.78;
+      }
+      .card.finished:hover { opacity: 1; }
+      /* v0.6.1 (Bug 2) — waiting_perm visual cue: amber left border +
+       * darker background tint. Catches the user's eye so they notice
+       * "this session is blocked on me". */
+      .card.waiting-perm {
+        border-left: 3px solid #ff8c21;
+        background: linear-gradient(90deg, #fff8ee 0%, #ffffff 14%);
+        padding-left: 8px;
+      }
+
+      .card-row {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+      .card-title {
+        flex: 1 1 auto;
+        min-width: 0;
+        font-size: 13px;
+        line-height: 1.25;
+        font-weight: 700;
+        color: #1a1a1a;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .card-icon {
+        flex: 0 0 auto;
+        width: 14px;
+        height: 14px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+      }
+      .card-icon svg { display: block; }
+      .card .card-spinner {
+        width: 12px;
+        height: 12px;
+        border: 1.5px solid rgba(0, 0, 0, 0.15);
+        border-top-color: #1a1a1a;
+        border-radius: 50%;
+        animation: card-spin 0.9s linear infinite;
+      }
+      @keyframes card-spin { to { transform: rotate(360deg); } }
+      .card .card-clock { color: #ff8c21; }   /* amber for waiting_perm */
+      .card .card-check { color: #34c759; }   /* iOS green for finished */
+
+      .card-subtitle {
+        margin-top: 3px;
+        font-size: 12px;
+        line-height: 1.35;
+        color: #555555;
+        font-weight: 400;
+        display: -webkit-box;
+        -webkit-line-clamp: 2;
+        -webkit-box-orient: vertical;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        word-break: break-word;
+      }
+      .card-subtitle:empty { display: none; margin: 0; }
+
+      @media (prefers-color-scheme: dark) {
+        .card { background: #ffffff; color: #1a1a1a; }
+      }
+
+      /* ---- v0.4.2 layout: boba TOP-RIGHT, card RIGHT BELOW ---- */
 
       /* Pet container: holds the sprite + the toggle (chevron / badge).
-       * In row 1, right-aligned (justify-self: end).  pet sprite + toggle
-       * are positioned within. */
+       * v0.6.1: row 2 (bottom). justify-self: end keeps pet at bottom-right.
+       */
       .pet-host {
         position: relative;
         justify-self: end;
-        align-self: start;
+        align-self: end;
         width: auto;
         height: auto;
       }
@@ -64,10 +189,6 @@
        * Hidden entirely when there are no active sessions. */
       .pet-toggle {
         position: absolute;
-        /* Anchor to pet's top-right corner with slight outward offset so
-         * the badge half-overlaps the sprite (visually attached to it
-         * rather than floating loose). Requires .stage to have
-         * overflow:visible (or the negative offsets get clipped). */
         top: -4px;
         right: -4px;
         width: 22px;
@@ -84,10 +205,6 @@
         background: #ffffff;
         color: #333333;
         border: none;
-        /* Soft drop on transparent desktop windows: same recipe as the
-         * task card — wide shadow with high alpha (e.g. 0 2px 6px α0.18)
-         * renders as a visible grey halo on the wallpaper. Stay tight,
-         * low-alpha, and use a hairline ring to define the edge. */
         box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06),
                     0 2px 6px rgba(0, 0, 0, 0.05),
                     0 0 0 0.5px rgba(0, 0, 0, 0.08);
@@ -100,11 +217,6 @@
       .pet-toggle:hover { background: #f3f6fb; transform: scale(1.05); }
       .pet-toggle:active { transform: scale(0.92); }
       .pet-host.has-tasks .pet-toggle { display: inline-flex; }
-      /* Chevron (expanded state) vs count (collapsed state) — only one
-       * shown at a time, controlled by .pet-host.collapsed class. SVG path
-       * guaranteed to render as a real ∨ shape regardless of system font
-       * (the previous `⌄` U+2304 character fell back to plain "v" letter
-       * in macOS WebView). */
       .pet-toggle .pet-toggle-chevron { display: block; }
       .pet-toggle .pet-toggle-count { display: none; font-size: 12px; font-weight: 600; line-height: 1; }
       .pet-host.collapsed .pet-toggle .pet-toggle-chevron { display: none; }
@@ -117,142 +229,8 @@
                     0 0 0 0.5px rgba(255, 255, 255, 0.4) inset;
       }
       .pet-host.collapsed .pet-toggle:hover { background: #3a7fd0; }
-
-      /* ---- Task card (row 2, naturally below the pet via grid layout) ---- */
-      .bubble {
-        align-self: start;       /* hug top of row 2 — i.e. right under the pet */
-        background: #ffffff;
-        color: #1a1a1a;
-        border: 1px solid rgba(0, 0, 0, 0.08);
-        border-radius: 14px;
-        box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06),
-                    0 2px 8px rgba(0, 0, 0, 0.05);
-        padding: 8px 10px 10px 10px;
-        opacity: 0;
-        transform: translateY(2px);
-        pointer-events: none;
-        transition: opacity 180ms ease-out, transform 180ms ease-out;
-        width: 100%;
-        box-sizing: border-box;
-      }
-      .bubble.show { opacity: 1; transform: translateY(0); pointer-events: auto; }
-      .bubble.hidden { display: none !important; }
-
-      .bubble-row {
-        display: flex;
-        /* v0.4.2 (2/4): centerline-align badge ↔ title ↔ spinner/clock so
-         * the 22x22 badge midpoint sits on the title text midpoint. The
-         * old `flex-start` + per-element `margin-top` hacks (badge 1px,
-         * spinner 4px) were eyeballed offsets that drifted as soon as
-         * the title font size or row height changed. */
-        align-items: center;
-        gap: 8px;
-      }
-      .bubble .badge {
-        flex: 0 0 auto;
-        width: 22px;
-        height: 22px;
-        border-radius: 6px;
-        background-image: url("badge.png");
-        background-size: cover;
-        background-position: center;
-        background-repeat: no-repeat;
-      }
-      .bubble .title {
-        flex: 0 1 auto;        /* shrink-only — don't push spinner away with empty space */
-        min-width: 0;          /* allow ellipsis to actually trigger inside flex */
-        font-size: 13px;
-        line-height: 1.25;
-        font-weight: 700;
-        letter-spacing: 0.1px;
-        color: #1a1a1a;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-      }
-      /* Spacer pushes spinner/clock to the right edge regardless of how short
-       * the title text is. Using a flex-grow spacer keeps the spinner pinned
-       * to the right while letting the title hug its own width on the left. */
-      .bubble .spacer {
-        flex: 1 1 0;
-        min-width: 4px;        /* always at least a tiny gap before icon */
-      }
-      /* v0.4.3 — three top-right card icons (spinner / clock / check):
-       * unified position + size, only one visible at a time. Precedence
-       * (CSS rules later in the cascade win):
-       *   waiting > done > loading > none
-       * v0.4.3 fix: use absolute positioning so all three icons occupy
-       * the EXACT same pixel rect (top-right of bubble row). Otherwise
-       * spinner's border-radius hairline shifted vs check's stroke
-       * vertical center, looking misaligned when swapping. */
-      .bubble .icon-slot {
-        flex: 0 0 auto;
-        position: relative;
-        width: 14px;
-        height: 14px;
-      }
-      .bubble .spinner,
-      .bubble .clock,
-      .bubble .check {
-        position: absolute;
-        top: 0;
-        left: 0;
-        width: 14px;
-        height: 14px;
-        opacity: 0;
-        transition: opacity 150ms ease-out;
-        box-sizing: border-box;
-      }
-      .bubble .spinner {
-        border: 1.5px solid rgba(0, 0, 0, 0.15);
-        border-top-color: #1a1a1a;
-        border-radius: 50%;
-        animation: bubble-spin 0.9s linear infinite;
-      }
-      .bubble .clock { display: block; color: #999; }
-      .bubble .check { display: block; color: #34c759; }   /* iOS system green */
-      .bubble.loading .spinner { opacity: 1; }
-      .bubble.done    .check   { opacity: 1; }
-      /* waiting takes precedence: clock visible, spinner & check hidden. */
-      .bubble.waiting .clock   { opacity: 1; }
-      .bubble.waiting .spinner,
-      .bubble.waiting .check   { opacity: 0; }
-      /* done takes precedence over loading: check visible, spinner hidden. */
-      .bubble.done    .spinner { opacity: 0; }
-      /* v0.4.4 — done state: cursor changes to pointer over the whole card
-       * to signal "click/hover anywhere to dismiss". Combined with the JS
-       * mouseenter listener below, the entire .bubble area is the hit zone
-       * (semantics restored from v0.4.3 after a misunderstood v0.4.4 detour
-       * that tried to require an explicit X click). */
-      .bubble.done    { cursor: pointer; }
-      @keyframes bubble-spin { to { transform: rotate(360deg); } }
-
-      .bubble .subtitle {
-        margin-top: 2px;
-        margin-left: 0;
-        font-size: 12px;
-        line-height: 1.35;
-        color: #555555;
-        font-weight: 400;
-        display: -webkit-box;
-        -webkit-line-clamp: 2;
-        -webkit-box-orient: vertical;
-        overflow: hidden;
-        text-overflow: ellipsis;
-      }
-      .bubble .subtitle:empty { display: none; margin: 0; }
-
-      .bubble.compact {
-        padding: 5px 10px 5px 6px;
-        max-width: 220px;
-        border-radius: 999px;
-      }
-      .bubble.compact .subtitle { display: none; }
-      .bubble.compact .title { font-size: 13px; font-weight: 600; }
-
-      @media (prefers-color-scheme: dark) {
-        .bubble { background: #ffffff; color: #1a1a1a; }
-      }
+      .pet-host.collapsed ~ .cards-stack,
+      body.cards-collapsed .cards-stack { display: none; }
 
       /* ---- pet sprite animations(unchanged from v0.4.1)---------------- */
       /* steps(5, jump-none) + to: -4*W is the macOS-26-safe pattern; see
@@ -278,7 +256,10 @@
   </head>
   <body data-tauri-drag-region>
     <div class="stage" data-tauri-drag-region>
-      <!-- Pet sprite + toggle handle (top-right) -->
+      <!-- v0.6.1 cards stack (row 1, anchors to bottom-right; new cards push up) -->
+      <div class="cards-stack" id="cards-stack" data-tauri-drag-region></div>
+
+      <!-- Pet sprite + toggle handle (row 2, bottom-right) -->
       <div class="pet-host" id="pet-host">
         <div class="pet idle" id="pet" data-tauri-drag-region></div>
         <button class="pet-toggle" id="pet-toggle" type="button" title="">
@@ -290,36 +271,6 @@
           <span class="pet-toggle-count" aria-hidden="true"></span>
         </button>
       </div>
-
-      <!-- Task card (below pet) -->
-      <div class="bubble" id="bubble">
-        <div class="bubble-row">
-          <span class="badge" aria-hidden="true"></span>
-          <span class="title" id="bubble-title"></span>
-          <span class="spacer" aria-hidden="true"></span>
-          <span class="icon-slot" aria-hidden="true">
-            <span class="spinner"></span>
-            <!-- v0.4.3 — SF Symbols 'clock' style: hairline circle + 12 o'clock
-                 hour hand + 3 o'clock minute hand, all in currentColor (light
-                 grey via .bubble .clock { color: #999 }). -->
-            <svg class="clock" viewBox="0 0 14 14"
-                 fill="none" stroke="currentColor" stroke-width="1.2"
-                 stroke-linecap="round" stroke-linejoin="round">
-              <circle cx="7" cy="7" r="5.5" />
-              <line x1="7" y1="7" x2="7" y2="3.5" />
-              <line x1="7" y1="7" x2="9.5" y2="7" />
-            </svg>
-            <!-- v0.4.3 — green check icon: shown when broker reports
-                 done:true (session.finish). iOS system green (#34c759). -->
-            <svg class="check" viewBox="0 0 14 14"
-                 fill="none" stroke="currentColor" stroke-width="1.8"
-                 stroke-linecap="round" stroke-linejoin="round">
-              <polyline points="3 7.5, 6 10, 11 4.5" />
-            </svg>
-          </span>
-        </div>
-        <div class="subtitle" id="bubble-subtitle"></div>
-      </div>
     </div>
     <script>
       const STATES = ['idle', 'wave', 'run', 'jump', 'review', 'failed', 'extra1', 'extra2'];
@@ -330,15 +281,14 @@
       const petEl = document.getElementById('pet');
       const toggleEl = document.getElementById('pet-toggle');
       const toggleCountEl = toggleEl.querySelector('.pet-toggle-count');
-      const bubbleEl = document.getElementById('bubble');
-      const bubbleTitleEl = document.getElementById('bubble-title');
-      const bubbleSubtitleEl = document.getElementById('bubble-subtitle');
+      const cardsEl = document.getElementById('cards-stack');
       let currentState = 'idle';
-      let bubbleHideTimer = null;
 
-      // Latest task-card payload from broker (cache for show/hide on toggle).
-      let lastCard = null;       // { title, subtitle, loading, waiting } | null
-      let activeCount = 0;       // Number of active mavis sessions
+      // v0.6.1 — current sessions snapshot (latest WS push). Map for fast
+      // lookup by sessionId; render walks Map.values() ordered by lastEventTs.
+      let sessionsBySid = new Map();   // sid → SessionCard
+      // Tracks card DOM elements by sid for diff-render.
+      const cardEls = new Map();       // sid → HTMLDivElement
 
       // User-controlled collapsed state, persisted across reloads.
       const COLLAPSED_KEY = 'mavis-pet:collapsed';
@@ -388,87 +338,192 @@
         currentState = state;
       }
 
-      // ---- Card rendering -------------------------------------------------
-      // The card is a singleton always-on display (v0.4.2). Visibility rules:
-      //   - activeCount == 0           → hidden (no tasks)
-      //   - collapsed == true          → hidden (user folded)
-      //   - else                       → shown with lastCard contents
-      function renderUi() {
-        // Toggle visibility of the toggle handle + its skin.
+      // ---- v0.6.1 cards stack rendering ----------------------------------
+
+      function escapeText(s) {
+        // textContent assignment auto-escapes; helper is for inline strings.
+        return String(s ?? '');
+      }
+
+      // v0.6.1 — build a single card's DOM. Returns HTMLDivElement.
+      function buildCard(card) {
+        const root = document.createElement('div');
+        root.className = 'card';
+        root.dataset.sid = card.sessionId;
+
+        const row = document.createElement('div');
+        row.className = 'card-row';
+
+        const titleEl = document.createElement('span');
+        titleEl.className = 'card-title';
+        // title preference: real session title > agent display name >
+        // fallback "Session <prefix>" so a brand-new session that hasn't
+        // resolved its title yet still has SOMETHING to show.
+        titleEl.textContent =
+          card.title || card.agentName ||
+          `Session ${String(card.sessionId).slice(0, 8)}`;
+        row.appendChild(titleEl);
+
+        const iconSlot = document.createElement('span');
+        iconSlot.className = 'card-icon';
+        // Icon precedence: waiting_perm clock > finished check > default spinner.
+        const isWaitingPerm = card.currentAction === '等待审批';
+        if (isWaitingPerm) {
+          iconSlot.innerHTML = `<svg class="card-clock" width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="7" cy="7" r="5.5"/><line x1="7" y1="7" x2="7" y2="3.5"/><line x1="7" y1="7" x2="9.5" y2="7"/></svg>`;
+        } else if (card.status === 'finished') {
+          iconSlot.innerHTML = `<svg class="card-check" width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 7.5, 6 10, 11 4.5"/></svg>`;
+        } else {
+          const spin = document.createElement('span');
+          spin.className = 'card-spinner';
+          iconSlot.appendChild(spin);
+        }
+        row.appendChild(iconSlot);
+        root.appendChild(row);
+
+        // Subtitle: prefer lastMessage (real assistant text) > currentAction
+        // (broker stub like "正在思考"). Empty string hides via :empty rule.
+        const sub = document.createElement('div');
+        sub.className = 'card-subtitle';
+        const subtitleText = card.lastMessage || card.currentAction || '';
+        // Truncate to 80 chars at JS layer too (broker also truncates,
+        // belt + suspenders against any overlong sneaks).
+        sub.textContent = subtitleText.length > 80
+          ? subtitleText.slice(0, 79) + '…'
+          : subtitleText;
+        root.appendChild(sub);
+
+        // Class flags for finished / waiting visual states.
+        if (card.status === 'finished') root.classList.add('finished');
+        if (isWaitingPerm) root.classList.add('waiting-perm');
+
+        // Click → invoke open_session_url (Rust side handles `open` shellout +
+        // empty-url → `open -a "MiniMax Test"` focus-only fallback).
+        // mousedown stopPropagation prevents the body's start-drag handler
+        // from kicking in when clicking a card.
+        root.addEventListener('mousedown', (e) => e.stopPropagation());
+        root.addEventListener('click', (e) => {
+          e.stopPropagation();
+          const url = card.deeplink || '';
+          if (!invoke) return;
+          invoke('open_session_url', { url }).catch((err) => {
+            console.warn('[mavis-pet] open_session_url failed:', err);
+          });
+        });
+
+        return root;
+      }
+
+      // v0.6.1 — diff-render cards stack from sessionsBySid map.
+      // Already-present cards stay (just data-update); new cards get inserted
+      // with .show next tick (so the CSS transition fires); removed cards get
+      // .leaving + setTimeout unmount.
+      function renderCards() {
+        // Sort sessions by lastEventTs descending (most recent on top).
+        const ordered = Array.from(sessionsBySid.values())
+          .sort((a, b) => (b.lastEventTs || 0) - (a.lastEventTs || 0));
+
+        const seenSids = new Set();
+        // Rebuild DOM in-order (DOM children re-arranged in place by appendChild
+        // when the node is already a child — moves rather than copies).
+        for (const card of ordered) {
+          seenSids.add(card.sessionId);
+          let el = cardEls.get(card.sessionId);
+          if (!el) {
+            el = buildCard(card);
+            cardEls.set(card.sessionId, el);
+            cardsEl.appendChild(el);
+            // Trigger fade-in next frame (avoid initial-render skipping
+            // transition because element starts with .show class).
+            requestAnimationFrame(() => requestAnimationFrame(() => el.classList.add('show')));
+          } else {
+            // Update existing card's content in-place (avoid full rebuild —
+            // would lose hover state / ongoing transitions).
+            updateCard(el, card);
+            // Re-anchor in DOM so the order matches sort.
+            cardsEl.appendChild(el);
+          }
+        }
+
+        // Drop cards no longer in the snapshot (broker evicted them).
+        for (const [sid, el] of cardEls.entries()) {
+          if (seenSids.has(sid)) continue;
+          el.classList.remove('show');
+          el.classList.add('leaving');
+          cardEls.delete(sid);
+          // Keep DOM until transition completes so user sees the fade-out.
+          setTimeout(() => {
+            try { el.remove(); } catch (_) { /* already gone */ }
+          }, 320);
+        }
+
+        // Pet-host badge / collapsed-state plumbing.
+        const activeCount = sessionsBySid.size;
         if (activeCount > 0) {
           petHostEl.classList.add('has-tasks');
           if (collapsed) {
             petHostEl.classList.add('collapsed');
             toggleCountEl.textContent = activeCount > 99 ? '99+' : String(activeCount);
             toggleEl.title = `${activeCount} active task${activeCount === 1 ? '' : 's'} — click to expand`;
+            document.body.classList.add('cards-collapsed');
           } else {
             petHostEl.classList.remove('collapsed');
             toggleCountEl.textContent = '';
-            toggleEl.title = 'Click to collapse task card';
+            toggleEl.title = 'Click to collapse task cards';
+            document.body.classList.remove('cards-collapsed');
           }
         } else {
           petHostEl.classList.remove('has-tasks', 'collapsed');
+          document.body.classList.remove('cards-collapsed');
         }
-
-        // Card visibility.
-        const shouldShowCard = activeCount > 0 && !collapsed && lastCard;
-        if (!shouldShowCard) {
-          bubbleEl.classList.remove('show');
-          return;
-        }
-        bubbleTitleEl.textContent = lastCard.title || '';
-        bubbleSubtitleEl.textContent = lastCard.subtitle || '';
-        bubbleEl.classList.toggle('compact', false);
-        bubbleEl.classList.toggle('loading', !!lastCard.loading);
-        // v0.4.2 (2/4): waiting trumps loading visually (CSS rule order
-        // ensures spinner hides when waiting is on). We still leave the
-        // `loading` class as-is so semantics survive a waiting→done flip.
-        bubbleEl.classList.toggle('waiting', !!lastCard.waiting);
-        // v0.4.3: done = green check, takes precedence over loading.
-        bubbleEl.classList.toggle('done', !!lastCard.done);
-        bubbleEl.classList.add('show');
       }
 
-      // Legacy compact-pill bubble path — used by the old WS protocol when only
-      // `bubble` is set (no `title`). Auto-dismisses after ttlMs.
-      function showLegacyBubble(opts) {
-        if (!opts || !opts.bubble) return;
-        bubbleTitleEl.textContent = opts.bubble;
-        bubbleSubtitleEl.textContent = '';
-        bubbleEl.classList.add('compact', 'show');
-        bubbleEl.classList.remove('loading', 'waiting', 'done');
-        if (bubbleHideTimer) { clearTimeout(bubbleHideTimer); bubbleHideTimer = null; }
-        const ttlMs = opts.ttlMs ?? 2500;
-        if (ttlMs > 0) {
-          bubbleHideTimer = setTimeout(() => {
-            bubbleEl.classList.remove('show');
-            bubbleHideTimer = null;
-          }, ttlMs);
+      // v0.6.1 — patch an existing card DOM element with fresh card data.
+      function updateCard(el, card) {
+        const titleEl = el.querySelector('.card-title');
+        const subEl = el.querySelector('.card-subtitle');
+        const iconSlot = el.querySelector('.card-icon');
+
+        const newTitle = card.title || card.agentName ||
+          `Session ${String(card.sessionId).slice(0, 8)}`;
+        if (titleEl.textContent !== newTitle) titleEl.textContent = newTitle;
+
+        const subtitleText = card.lastMessage || card.currentAction || '';
+        const truncated = subtitleText.length > 80
+          ? subtitleText.slice(0, 79) + '…'
+          : subtitleText;
+        if (subEl.textContent !== truncated) subEl.textContent = truncated;
+
+        const isWaitingPerm = card.currentAction === '等待审批';
+        const isFinished = card.status === 'finished';
+        // Re-derive icon (cheap rebuild, three-way switch).
+        let iconHtml;
+        if (isWaitingPerm) {
+          iconHtml = `<svg class="card-clock" width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="7" cy="7" r="5.5"/><line x1="7" y1="7" x2="7" y2="3.5"/><line x1="7" y1="7" x2="9.5" y2="7"/></svg>`;
+        } else if (isFinished) {
+          iconHtml = `<svg class="card-check" width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 7.5, 6 10, 11 4.5"/></svg>`;
+        } else {
+          iconHtml = `<span class="card-spinner"></span>`;
         }
+        iconSlot.innerHTML = iconHtml;
+
+        el.classList.toggle('finished', isFinished);
+        el.classList.toggle('waiting-perm', isWaitingPerm);
+
+        // Refresh stored deeplink reference so click handler uses latest value.
+        // (Click handler closes over the original card object passed to
+        // buildCard, so we mutate-in-place via a side store on the element.)
+        el._card = card;
       }
 
       // Wire the toggle button.
       toggleEl.addEventListener('click', (e) => {
         e.stopPropagation();
-        // Don't toggle if there's nothing to show.
-        if (activeCount === 0) return;
+        if (sessionsBySid.size === 0) return;
         collapsed = !collapsed;
         try { localStorage.setItem(COLLAPSED_KEY, collapsed ? '1' : '0'); } catch {}
-        renderUi();
+        renderCards();
       });
-      // Prevent the click from also dragging the window.
       toggleEl.addEventListener('mousedown', (e) => e.stopPropagation());
-
-      // v0.4.3 — when card is in `done` state (✓ green), hovering anywhere
-      // on the card POSTs /dismiss so the broker evicts the session and
-      // the card disappears. (v0.4.4 detour: tried explicit X click —
-      // wasn't what vino wanted; reverted to hover semantics.)
-      bubbleEl.addEventListener('mouseenter', () => {
-        if (!bubbleEl.classList.contains('done')) return;
-        fetch('http://127.0.0.1:7857/dismiss', { method: 'POST' }).catch(() => {
-          /* ignore — broker may be down */
-        });
-      });
 
       // ---- WS client -----------------------------------------------------
       const WS_URL = 'ws://127.0.0.1:7857/ws';
@@ -484,41 +539,17 @@
             const msg = JSON.parse(ev.data);
             if (msg.type === 'state' && typeof msg.state === 'string') {
               setState(msg.state);
-
-              // v0.4.2 — track active session count if present.
-              if (typeof msg.activeSessionCount === 'number') {
-                activeCount = Math.max(0, msg.activeSessionCount);
-              }
-
-              // Card data: only update lastCard if title is actually set.
-              // Empty title with activeCount > 0 means "we're tracking N
-              // sessions but don't have title data yet" — keep showing
-              // whatever we had.
-              if (msg.title || msg.subtitle) {
-                lastCard = {
-                  title: msg.title || '',
-                  subtitle: msg.subtitle || '',
-                  loading: !!msg.loading,
-                  waiting: !!msg.waiting,
-                  done: !!msg.done,
-                };
-              } else if (msg.title === '' && msg.subtitle === '' && activeCount === 0) {
-                // Explicit clear (no active session).
-                lastCard = null;
-              }
-              renderUi();
-
-              // Legacy fallback: only `bubble` set (old protocol).
-              if (msg.bubble && !msg.title) {
-                showLegacyBubble({ bubble: msg.bubble, ttlMs: msg.bubbleTtlMs });
-              }
             } else if (msg.type === 'pet' && typeof msg.slug === 'string') {
               loadPet(msg.slug);
-            } else if (msg.type === 'bubble') {
-              showLegacyBubble(msg);
-            } else if (msg.type === 'bubble-hide') {
-              bubbleEl.classList.remove('show');
-              if (bubbleHideTimer) { clearTimeout(bubbleHideTimer); bubbleHideTimer = null; }
+            } else if (msg.type === 'sessions' && Array.isArray(msg.sessions)) {
+              // v0.6.1 — replace full sessions snapshot with broker's view.
+              sessionsBySid = new Map();
+              for (const card of msg.sessions) {
+                if (card && typeof card.sessionId === 'string') {
+                  sessionsBySid.set(card.sessionId, card);
+                }
+              }
+              renderCards();
             }
           } catch { /* ignore non-JSON */ }
         };
@@ -535,13 +566,16 @@
 
       window.addEventListener('DOMContentLoaded', () => {
         loadPet(null);
-        renderUi();   // initial: nothing to show, but apply collapsed class state
+        renderCards();   // initial: nothing to show, but apply collapsed class state
         connect();
 
         document.body.addEventListener('mousedown', async (e) => {
           if (e.button !== 0) return;
-          // Don't start a window drag if the user clicked the toggle button.
+          // Don't start a window drag if the user clicked the toggle button
+          // OR a card body (cards have their own click handler that issues
+          // open_session_url; dragging would swallow that interaction).
           if (e.target.closest('.pet-toggle')) return;
+          if (e.target.closest('.card')) return;
           try {
             const w = window.__TAURI__?.window?.getCurrentWindow?.();
             if (w?.startDragging) {

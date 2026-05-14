@@ -8,10 +8,11 @@
 //   1. Locate the active pet (from ~/.mavis/pet/config.json or first
 //      pet found in ~/.mavis/pets/ or ~/.codex/pets/).
 //   2. Read the spritesheet bytes and pet.json metadata.
-//   3. Expose two Tauri commands to the WebView:
-//        get_pet()   -> { slug, mime, sprite_b64, frame_w, frame_h,
-//                         rows, cols, fps_per_state }
-//        list_pets() -> [slug, ...]   (for future pet-picker)
+//   3. Expose Tauri commands to the WebView:
+//        get_pet()           -> { slug, mime, sprite_b64, frame_w, frame_h,
+//                                 rows, cols, fps_per_state }
+//        list_pets()         -> [slug, ...]   (for future pet-picker)
+//        open_session_url()  -> launches `open <deeplink>` for card click
 //   4. Emit a `pet-reload` event when the WebView calls reload_pet()
 //      so the JS side can re-fetch and rebuild the animation.
 //
@@ -341,6 +342,60 @@ fn reload_pet(app: tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// v0.6.1 — open a MiniMax deeplink (e.g. `minimax-cn-test://chat?chat_id=…`)
+/// or fall back to focusing the MiniMax Test app, called from the floater's
+/// JS card click handler.
+///
+/// Behavior:
+///   - empty / None url → `open -a "MiniMax Test"` (focus only)
+///   - any of the known MiniMax URL schemes → `open <url>` (deeplink)
+///   - anything else → reject (defends against injected payloads)
+///
+/// We hardcode `/usr/bin/open` to avoid PATH lookup races and don't rely
+/// on tauri-plugin-shell (would require a capability allow + bumps the
+/// closed-shell-allowlist surface area).
+#[tauri::command]
+fn open_session_url(url: Option<String>) -> Result<(), String> {
+    let raw = url.unwrap_or_default();
+    let trimmed = raw.trim();
+
+    // Empty / focus-only fallback path (Step 0 fallback when broker has no
+    // deeplink template configured or MiniMax main process can't navigate
+    // to a specific session yet).
+    if trimmed.is_empty() {
+        let status = std::process::Command::new("/usr/bin/open")
+            .args(["-a", "MiniMax Test"])
+            .status()
+            .map_err(|e| format!("spawn open -a: {e}"))?;
+        if !status.success() {
+            return Err(format!("open -a exited with {status}"));
+        }
+        return Ok(());
+    }
+
+    // Whitelist: only known MiniMax URL schemes (Test / Staging / Prod, EN/CN).
+    let allowed_schemes = [
+        "minimax://",
+        "minimax-cn://",
+        "minimax-test://",
+        "minimax-cn-test://",
+        "minimax-staging://",
+        "minimax-cn-staging://",
+    ];
+    if !allowed_schemes.iter().any(|p| trimmed.starts_with(p)) {
+        return Err(format!("rejected non-MiniMax URL scheme: {trimmed}"));
+    }
+
+    let status = std::process::Command::new("/usr/bin/open")
+        .arg(trimmed)
+        .status()
+        .map_err(|e| format!("spawn open: {e}"))?;
+    if !status.success() {
+        return Err(format!("open exited with {status}"));
+    }
+    Ok(())
+}
+
 // ---- Entry point ----------------------------------------------------------
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -351,7 +406,12 @@ pub fn run() {
         // `to_panel` looks up. If we register after setup, `to_panel` panics
         // with "PanelManager not found in app state".
         .plugin(tauri_nspanel::init())
-        .invoke_handler(tauri::generate_handler![get_pet, list_pets, reload_pet])
+        .invoke_handler(tauri::generate_handler![
+            get_pet,
+            list_pets,
+            reload_pet,
+            open_session_url
+        ])
         .setup(|app| {
             // Touch the path to surface "no home dir" failures early in stderr.
             let _ = config_path();

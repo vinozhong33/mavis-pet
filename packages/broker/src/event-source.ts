@@ -26,6 +26,7 @@
 
 import type { Clock, TimerHandle } from "./clock.js";
 import type { Logger } from "./logger.js";
+import type { SessionCard } from "./types.js";
 
 const DEFAULT_DAEMON_URL =
   process.env.MAVIS_DAEMON_URL ?? "http://127.0.0.1:15321";
@@ -43,6 +44,8 @@ export interface ActiveSession {
   status?: string;
   /** ms ts of the last event that touched this session. */
   lastTouchedAt: number;
+  /** v0.6.1 — ms ts when status flipped to 'finished' (drives 30s evict). */
+  finishedAt?: number;
   /** When non-null, an evict timer scheduled for this session. */
   evictTimer?: TimerHandle | null;
   /**
@@ -70,7 +73,9 @@ export interface EventSourceOptions {
   fetchImpl?: typeof fetch;
   /**
    * ms to wait after a session goes 'finished' before evicting it from the
-   * pool. Default 0 — sticky until floater POST /dismiss explicitly.
+   * pool. v0.6.1 default 30_000 (30s) — gives the user 30s to glance at the
+   * "done" card before it fades. Set to 0 to disable auto-evict (sticky
+   * until /dismiss POST).
    */
   evictAfterMs?: number;
   /** Initial reconnect backoff ms. Default 500. */
@@ -96,12 +101,26 @@ export interface EventSourceOptions {
    * Server wires this to `machine.ingest({kind:"PermissionResolved",sessionId})`.
    */
   onPermissionResolved?: (sessionId: string) => void;
+  /**
+   * v0.6.1 — pre-built deeplink template fed into each SessionCard.
+   * Format: `<scheme>://<action>?<param>={SID}` where {SID} is replaced
+   * with the actual sessionId. Example: `minimax-cn-test://chat?chat_id={SID}`.
+   * When undefined, SessionCard.deeplink is omitted and the floater
+   * falls back to `open -a` focus only.
+   */
+  deeplinkTemplate?: string;
 }
 
 export interface EventSourceHandle {
   start(): void;
   stop(): void;
   getActiveSessions(): Map<string, ActiveSession>;
+  /**
+   * v0.6.1 — return all visible (non-hidden) sessions as SessionCard[]
+   * sorted by `lastEventTs` descending (most recent on top). Used by the
+   * server to broadcast `{type:"sessions"}` WS messages.
+   */
+  getSessionCards(): SessionCard[];
   activeCount(): number;
   /**
    * Explicitly evict the session whose card the floater just dismissed
@@ -136,12 +155,13 @@ function toolNameZh(tool: string | undefined): string | undefined {
 export function createEventSource(opts: EventSourceOptions): EventSourceHandle {
   const baseUrl = opts.daemonUrl ?? DEFAULT_DAEMON_URL;
   const fetchImpl = opts.fetchImpl ?? fetch;
-  const evictAfterMs = opts.evictAfterMs ?? 0;
+  const evictAfterMs = opts.evictAfterMs ?? 30_000;
   const initialBackoffMs = opts.initialBackoffMs ?? 500;
   const maxBackoffMs = opts.maxBackoffMs ?? 30_000;
   const maxMessageChars = opts.maxMessageChars ?? 80;
   const log = opts.logger;
   const onSessionUpdate = opts.onSessionUpdate;
+  const deeplinkTemplate = opts.deeplinkTemplate;
 
   const sessions = new Map<string, ActiveSession>();
   let abortController: AbortController | null = null;
@@ -200,10 +220,12 @@ export function createEventSource(opts: EventSourceOptions): EventSourceHandle {
       opts.clock.clearTimeout(s.evictTimer);
       s.evictTimer = null;
     }
+    s.finishedAt = undefined;
   }
 
   function scheduleEvict(s: ActiveSession): void {
     cancelEvict(s);
+    s.finishedAt = opts.clock.now();
     if (evictAfterMs <= 0) return; // sticky — wait for /dismiss
     s.evictTimer = opts.clock.setTimeout(() => {
       sessions.delete(s.sessionId);
@@ -314,6 +336,7 @@ export function createEventSource(opts: EventSourceOptions): EventSourceHandle {
           }
           case "calling_tool": {
             sess.status = "started";
+            cancelEvict(sess); // back to active — drop any pending evict
             const tool = (payload as { tool?: string }).tool;
             sess.currentAction = toolNameZh(tool) ?? "正在调用工具";
             // calling_tool implies any pending perm was just allow'd
@@ -323,6 +346,7 @@ export function createEventSource(opts: EventSourceOptions): EventSourceHandle {
           }
           case "streaming_text": {
             sess.status = "started";
+            cancelEvict(sess); // back to active — drop any pending evict
             // Real assistant text is now flowing — drop the "正在思考" stub.
             sess.currentAction = undefined;
             const preview = (payload as { textPreview?: string }).textPreview;
@@ -334,6 +358,7 @@ export function createEventSource(opts: EventSourceOptions): EventSourceHandle {
           case "waiting_perm": {
             // Floater enters review state via the state machine; the card
             // subtitle gets a "等待审批" cue while there.
+            cancelEvict(sess); // active again, blocked on user
             sess.currentAction = "等待审批";
             const reqId = (payload as { permRequestId?: string }).permRequestId;
             opts.onPermissionRequested?.(sid, reqId);
@@ -346,7 +371,7 @@ export function createEventSource(opts: EventSourceOptions): EventSourceHandle {
             if (typeof finalMsg === "string" && finalMsg.trim()) {
               sess.lastMessage = truncate(finalMsg, maxMessageChars);
             }
-            // Turn end implies any pending perm resolved one way or another.
+            // Turn end implies any pending perm resolved one way or the other.
             opts.onPermissionResolved?.(sid);
             scheduleEvict(sess);
             break;
@@ -500,16 +525,52 @@ export function createEventSource(opts: EventSourceOptions): EventSourceHandle {
           /* ignore */
         }
       }
+      // Clear any in-flight evict timers so close() doesn't leave orphaned
+      // setTimeout handles (matters in tests using FakeClock + vitest).
+      for (const s of sessions.values()) {
+        if (s.evictTimer) opts.clock.clearTimeout(s.evictTimer);
+        s.evictTimer = null;
+      }
       log?.info("event_source_stopped");
     },
     getActiveSessions(): Map<string, ActiveSession> {
       return new Map(sessions);
+    },
+    getSessionCards(): SessionCard[] {
+      // Convert internal ActiveSession map to public SessionCard[],
+      // skip cron-flagged hidden sessions, sort by lastEventTs descending
+      // (most recent activity on top of the floater's vertical stack).
+      const out: SessionCard[] = [];
+      for (const s of sessions.values()) {
+        if (s.hidden) continue;
+        const card: SessionCard = {
+          sessionId: s.sessionId,
+          status: s.status === "finished" ? "finished" : "started",
+          lastEventTs: s.lastTouchedAt,
+        };
+        if (s.title) card.title = s.title;
+        if (s.displayName) card.agentName = s.displayName;
+        if (s.currentAction) card.currentAction = s.currentAction;
+        if (s.lastMessage) card.lastMessage = s.lastMessage;
+        if (s.finishedAt !== undefined) card.finishedAt = s.finishedAt;
+        if (deeplinkTemplate) {
+          card.deeplink = deeplinkTemplate.replace(
+            /\{SID\}/g,
+            encodeURIComponent(s.sessionId),
+          );
+        }
+        out.push(card);
+      }
+      out.sort((a, b) => b.lastEventTs - a.lastEventTs);
+      return out;
     },
     activeCount(): number {
       return sessions.size;
     },
     dismissCurrent(sessionId: string | null): void {
       if (sessionId) {
+        const s = sessions.get(sessionId);
+        if (s?.evictTimer) opts.clock.clearTimeout(s.evictTimer);
         sessions.delete(sessionId);
       } else {
         // Drop the most-recently-touched non-hidden session.
@@ -518,7 +579,10 @@ export function createEventSource(opts: EventSourceOptions): EventSourceHandle {
           if (s.hidden) continue;
           if (!best || s.lastTouchedAt > best.lastTouchedAt) best = s;
         }
-        if (best) sessions.delete(best.sessionId);
+        if (best) {
+          if (best.evictTimer) opts.clock.clearTimeout(best.evictTimer);
+          sessions.delete(best.sessionId);
+        }
       }
       onSessionUpdate?.();
     },

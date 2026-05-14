@@ -28,6 +28,9 @@ beforeEach(async () => {
     // and the SSE event-source consumer.
     disablePermPoller: true,
     disableEventSource: true,
+    // v0.6.1 — disable sessions debouncing so direct broadcastSessions()
+    // calls in tests flush immediately (no 100ms wait).
+    sessionsDebounceMs: 0,
   });
 });
 
@@ -458,6 +461,164 @@ describe("broker HTTP + WS integration", () => {
     expect(run).not.toHaveProperty("title");
     expect(run).not.toHaveProperty("subtitle");
     expect(run).not.toHaveProperty("bubble");
+    await c.close();
+  });
+
+  // v0.6.1 — sessions broadcast smoke tests. Verifies the new
+  // {type:"sessions", sessions: SessionCard[]} message variant.
+  // disableEventSource:true means there's no real SSE pool, so we drive
+  // the hub directly via broker.hub.broadcastSessions(...) — that lets us
+  // test the WS schema without spinning up a fake daemon.
+  it("v0.6.1 — new client receives initial empty sessions snapshot on connect", async () => {
+    const c = await connectWs();
+    const initial = await c.waitFor((m) => m.type === "sessions");
+    // disableEventSource:true → getCurrentSessions returns []
+    // (server.ts ternary: `eventSource ? eventSource.getSessionCards() : []`).
+    expect(initial).toEqual({ type: "sessions", sessions: [] });
+    await c.close();
+  });
+
+  it("v0.6.1 — broadcastSessions pushes {type:'sessions'} with full SessionCard array", async () => {
+    const c = await connectWs();
+    // Drain initial state + sessions.
+    await c.waitFor((m) => m.type === "state");
+    await c.waitFor((m) => m.type === "sessions");
+
+    broker!.hub.broadcastSessions([
+      {
+        sessionId: "sess-A",
+        agentName: "mavis健康",
+        title: "测试任务 A",
+        currentAction: "正在思考",
+        status: "started",
+        lastEventTs: 1_700_000_000_000,
+        deeplink: "minimax-cn-test://chat?chat_id=sess-A",
+      },
+      {
+        sessionId: "sess-B",
+        title: "Bug 修复",
+        lastMessage: "已经定位到根因，准备开始修",
+        status: "started",
+        lastEventTs: 1_700_000_001_000,
+      },
+    ]);
+
+    const msg = await c.waitFor(
+      (m) =>
+        m.type === "sessions" &&
+        Array.isArray((m as { sessions: unknown[] }).sessions) &&
+        (m as { sessions: unknown[] }).sessions.length === 2,
+    );
+    expect(msg).toMatchObject({
+      type: "sessions",
+      sessions: [
+        {
+          sessionId: "sess-A",
+          agentName: "mavis健康",
+          title: "测试任务 A",
+          currentAction: "正在思考",
+          status: "started",
+          lastEventTs: 1_700_000_000_000,
+          deeplink: "minimax-cn-test://chat?chat_id=sess-A",
+        },
+        {
+          sessionId: "sess-B",
+          title: "Bug 修复",
+          lastMessage: "已经定位到根因，准备开始修",
+          status: "started",
+          lastEventTs: 1_700_000_001_000,
+        },
+      ],
+    });
+    await c.close();
+  });
+
+  it("v0.6.1 — broadcastSessions([]) clears floater card stack", async () => {
+    const c = await connectWs();
+    await c.waitFor((m) => m.type === "sessions");
+
+    broker!.hub.broadcastSessions([
+      { sessionId: "tmp", status: "started", lastEventTs: 1 },
+    ]);
+    await c.waitFor(
+      (m) =>
+        m.type === "sessions" &&
+        (m as { sessions: unknown[] }).sessions.length === 1,
+    );
+
+    broker!.hub.broadcastSessions([]);
+    const cleared = await c.waitFor(
+      (m) =>
+        m.type === "sessions" &&
+        (m as { sessions: unknown[] }).sessions.length === 0,
+    );
+    expect(cleared).toEqual({ type: "sessions", sessions: [] });
+    await c.close();
+  });
+
+  it("v0.6.1 — finished session card carries finishedAt for floater fade-out semantics", async () => {
+    const c = await connectWs();
+    await c.waitFor((m) => m.type === "sessions");
+
+    broker!.hub.broadcastSessions([
+      {
+        sessionId: "sess-done",
+        title: "Finished task",
+        status: "finished",
+        lastEventTs: 1_700_000_005_000,
+        finishedAt: 1_700_000_005_000,
+      },
+    ]);
+
+    const msg = await c.waitFor(
+      (m) =>
+        m.type === "sessions" &&
+        (m as { sessions: { sessionId?: string }[] }).sessions[0]?.sessionId ===
+          "sess-done",
+    );
+    expect(msg).toMatchObject({
+      type: "sessions",
+      sessions: [
+        {
+          sessionId: "sess-done",
+          status: "finished",
+          finishedAt: 1_700_000_005_000,
+        },
+      ],
+    });
+    await c.close();
+  });
+
+  it("v0.6.1 — waiting_perm currentAction surfaces on SessionCard", async () => {
+    const c = await connectWs();
+    await c.waitFor((m) => m.type === "sessions");
+
+    broker!.hub.broadcastSessions([
+      {
+        sessionId: "sess-perm",
+        title: "Bash command needs approval",
+        currentAction: "等待审批",
+        status: "started",
+        lastEventTs: 1_700_000_010_000,
+      },
+    ]);
+
+    const msg = await c.waitFor(
+      (m) =>
+        m.type === "sessions" &&
+        (m as { sessions: { sessionId?: string }[] }).sessions[0]?.sessionId ===
+          "sess-perm",
+    );
+    expect(msg).toMatchObject({
+      type: "sessions",
+      sessions: [
+        {
+          sessionId: "sess-perm",
+          currentAction: "等待审批",
+          status: "started",
+        },
+      ],
+    });
     await c.close();
   });
 });

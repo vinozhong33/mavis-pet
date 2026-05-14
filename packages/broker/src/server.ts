@@ -24,6 +24,18 @@ export const DEFAULT_HOST = "127.0.0.1";
 export const DEFAULT_PORT = 7857;
 
 /**
+ * v0.6.1 — default MiniMax deeplink template (Test build).
+ *
+ * Resolved from {@link BrokerOptions.deeplinkTemplate} → env
+ * `MAVIS_PET_DEEPLINK_TEMPLATE` → this default. To disable deeplinks
+ * entirely, pass `deeplinkTemplate: null` (floater falls back to
+ * `open -a "MiniMax Test"` focus-only).
+ *
+ * The placeholder `{SID}` is substituted with the URL-encoded sessionId.
+ */
+const DEFAULT_DEEPLINK_TEMPLATE = "minimax-cn-test://chat?chat_id={SID}";
+
+/**
  * v0.4 task-card config — populates the bubble card the floater renders.
  *
  * - `title` (required) — bold one-line task title (ellipsised in the card).
@@ -96,6 +108,30 @@ export interface BrokerOptions {
    * real daemon. Default `false` (enabled).
    */
   disableEventSource?: boolean;
+  /**
+   * v0.6.1 — deeplink URL template baked into every SessionCard pushed
+   * to the floater. `{SID}` is substituted with the URL-encoded sessionId.
+   *
+   * Default: `minimax-cn-test://chat?chat_id={SID}` — the Test-build
+   * MiniMax URL scheme (production build is `minimax-cn://`,
+   * overseas build is `minimax://`). Set explicitly via the
+   * `MAVIS_PET_DEEPLINK_TEMPLATE` env var or pass `null` to disable
+   * deeplinks entirely (floater falls back to `open -a "MiniMax Test"`
+   * focus-only).
+   *
+   * Note: as of mavis-pet v0.6.1 the MiniMax main process only handles
+   * `auth-callback` actions out of the box; `chat?chat_id=…` deeplinks
+   * focus the window but do NOT navigate to the specific session yet.
+   * That handler is a MiniMax-side change to be done separately.
+   */
+  deeplinkTemplate?: string | null;
+  /**
+   * v0.6.1 — debounce window (ms) for sessions broadcast. Multiple
+   * onSessionUpdate calls within this window collapse into a single WS
+   * push. Default 100ms. Set 0 to disable debouncing (every change
+   * broadcasts immediately — useful for tests).
+   */
+  sessionsDebounceMs?: number;
 }
 
 export interface BrokerHandle {
@@ -176,6 +212,22 @@ export async function startBroker(opts: BrokerOptions = {}): Promise<BrokerHandl
   const recentEvents: HookEvent[] = [];
   const startedAt = clock.now();
 
+  // v0.6.1 — resolve deeplink template:
+  //   explicit `null` in opts → disabled (falsy → floater fallback)
+  //   `string` in opts → use as-is
+  //   undefined in opts → env MAVIS_PET_DEEPLINK_TEMPLATE → DEFAULT
+  let deeplinkTemplate: string | undefined;
+  if (opts.deeplinkTemplate === null) {
+    deeplinkTemplate = undefined;
+  } else if (typeof opts.deeplinkTemplate === "string") {
+    deeplinkTemplate = opts.deeplinkTemplate;
+  } else {
+    deeplinkTemplate =
+      process.env.MAVIS_PET_DEEPLINK_TEMPLATE || DEFAULT_DEEPLINK_TEMPLATE;
+  }
+
+  const sessionsDebounceMs = opts.sessionsDebounceMs ?? 100;
+
   const bubbles: Record<PetState, string | null> = {
     ...DEFAULT_BUBBLES,
     ...(opts.bubbles ?? {}),
@@ -186,6 +238,10 @@ export async function startBroker(opts: BrokerOptions = {}): Promise<BrokerHandl
   };
   const bubbleTtlMs = opts.bubbleTtlMs ?? 2_500;
 
+  // Forward declaration so WsHub.deps can capture eventSource via closure
+  // before it's actually constructed below. Filled in after createEventSource.
+  let eventSource: EventSourceHandle | null = null;
+
   const hub = new WsHub({
     clock,
     logger,
@@ -194,7 +250,40 @@ export async function startBroker(opts: BrokerOptions = {}): Promise<BrokerHandl
       ts: machine.lastChangeAt,
     }),
     getCurrentPet: () => petRef.slug,
+    // v0.6.1 — sends initial sessions snapshot to newly-connected clients.
+    getCurrentSessions: () => (eventSource ? eventSource.getSessionCards() : []),
   });
+
+  // -------------------------------------------------------------------------
+  // v0.6.1 — sessions broadcast debouncing.
+  //
+  // SSE event-source fires onSessionUpdate on every status_update phase
+  // (thinking / calling_tool / streaming_text / done) — that's potentially
+  // dozens of events per second during streaming. Debounce to one push
+  // per `sessionsDebounceMs` window so the WS doesn't get blasted.
+  // -------------------------------------------------------------------------
+  let sessionsDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+  let sessionsPendingFlush = false;
+
+  function flushSessions(): void {
+    sessionsPendingFlush = false;
+    if (!eventSource) return;
+    const list = eventSource.getSessionCards();
+    hub.broadcastSessions(list);
+  }
+
+  function scheduleSessionsBroadcast(): void {
+    if (sessionsDebounceMs <= 0) {
+      flushSessions();
+      return;
+    }
+    sessionsPendingFlush = true;
+    if (sessionsDebounceTimer) return; // already scheduled
+    sessionsDebounceTimer = setTimeout(() => {
+      sessionsDebounceTimer = null;
+      if (sessionsPendingFlush) flushSessions();
+    }, sessionsDebounceMs);
+  }
 
   // -------------------------------------------------------------------------
   // v0.4.2 — daemon SSE consumer (active session pool: title + lastMessage)
@@ -202,20 +291,24 @@ export async function startBroker(opts: BrokerOptions = {}): Promise<BrokerHandl
   // Constructed up front so the onChange listener can read it; the actual
   // network connect happens in `start()` further down.
   // -------------------------------------------------------------------------
-  let eventSource: EventSourceHandle | null = null;
   if (!opts.disableEventSource) {
     eventSource = createEventSource({
       clock,
       daemonUrl: opts.daemonUrl,
       logger,
+      deeplinkTemplate,
       // v0.4.3 — when SSE updates a session's title / lastMessage,
       // re-broadcast the current state so the floater immediately picks up
       // the new card content. Without this hook, SSE data only reaches the
       // floater when an unrelated hook event happens to fire onChange.
+      //
+      // v0.6.1 — also schedule a debounced sessions broadcast so the
+      // floater's card stack stays in sync with the SSE stream.
       onSessionUpdate: () => {
         const state = machine.globalState;
         const ts = clock.now();
         broadcastForState(state, ts);
+        scheduleSessionsBroadcast();
       },
       // v0.6 — primary perm-pending signal: daemon's session.status_update
       // event with phase=waiting_perm. Forwarded to the state machine so
@@ -387,6 +480,12 @@ export async function startBroker(opts: BrokerOptions = {}): Promise<BrokerHandl
     eventSource,
     async close() {
       logger.info("broker_stopping");
+      // v0.6.1 — drop any pending sessions debounce timer so close()
+      // doesn't leave dangling setTimeout handles.
+      if (sessionsDebounceTimer) {
+        clearTimeout(sessionsDebounceTimer);
+        sessionsDebounceTimer = null;
+      }
       if (eventSource) eventSource.stop();
       hub.closeAll();
       await new Promise<void>((resolve) => {

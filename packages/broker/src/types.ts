@@ -126,7 +126,55 @@ export interface WsPetMessage {
   slug: string;
 }
 
-export type WsOutMessage = WsStateMessage | WsPetMessage;
+/**
+ * v0.6.1 — single active mavis session, surfaced to the floater as one
+ * stacking card.
+ *
+ * Floater renders one card per entry, vertically stacked above the pet
+ * sprite. `lastEventTs` drives the sort order (most recent on top), and
+ * `status === "finished"` triggers the broker-side 30s evict timer.
+ *
+ * `deeplink` is a fully-formed URL (e.g. `minimax-cn-test://chat?chat_id=<sid>`)
+ * that the floater pipes directly through `open` on click — no string
+ * concatenation client-side. When the user has not configured
+ * `MAVIS_PET_DEEPLINK_SCHEME` and the broker can't determine a live
+ * scheme, `deeplink` may be `undefined` and the floater falls back to
+ * `open -a "MiniMax Test"` (focus only).
+ */
+export interface SessionCard {
+  sessionId: string;
+  /** Display name (e.g. "mavis健康") — fallback for missing real title. */
+  agentName?: string;
+  /** Real session title (from /mavis/api/session/<sid>) — preferred over agentName. */
+  title?: string;
+  /**
+   * Short Chinese verb describing what the session is currently doing.
+   * E.g. "正在思考", "执行命令", "等待审批". Empty when streaming text
+   * is the source of truth (use `lastMessage` instead).
+   */
+  currentAction?: string;
+  /** Streaming preview / final reply preview (broker truncates to ≤ 80 chars). */
+  lastMessage?: string;
+  /** Current session lifecycle status. */
+  status: "started" | "finished";
+  /** ms ts of the last event that touched this session — drives sort order. */
+  lastEventTs: number;
+  /** ms ts when status flipped to "finished" — used by 30s evict timer. */
+  finishedAt?: number;
+  /**
+   * Pre-built deeplink URL for the floater to `open` on click.
+   * Optional: when missing, floater falls back to `open -a` focus only.
+   */
+  deeplink?: string;
+}
+
+/** Outbound WebSocket message: full sessions snapshot (replaces all floater cards). */
+export interface WsSessionsMessage {
+  type: "sessions";
+  sessions: SessionCard[];
+}
+
+export type WsOutMessage = WsStateMessage | WsPetMessage | WsSessionsMessage;
 
 /** Snapshot returned by GET /status. */
 export interface StatusSnapshot {
