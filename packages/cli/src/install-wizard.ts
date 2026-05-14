@@ -555,11 +555,49 @@ function sleep(ms: number): Promise<void> {
 // ---- main wizard -----------------------------------------------------------
 
 /**
+ * v0.7.1 — Sandbox auto-detect. When opts.home is set AND differs from
+ * the real os.homedir(), the caller is running in a sandbox (verifier
+ * adversarial probe / temp-HOME e2e test / dry-run). In that case force
+ * noLaunchd=true so the wizard does NOT actually `launchctl bootstrap`
+ * the agent — which would spawn a real broker + floater that connect
+ * to the user's real desktop and leave orphan processes after the
+ * sandbox HOME is rm -rf'd.
+ *
+ * Bug this fixes: 2026-05-14, verifier ran wizard twice in sandbox HOMEs
+ * /var/folders/.../mavis-pet-verify-* during adversarial idempotency probe;
+ * each run launchctl-bootstrapped a real LaunchAgent which spawned floater
+ * binaries from the (about-to-be-deleted) sandbox path. The agents stayed
+ * registered with launchd after sandbox cleanup → orphan floater windows
+ * on user's real desktop.
+ *
+ * Override: set MAVIS_PET_FORCE_LAUNCHD=1 to skip this auto-detect (rare
+ * case where someone really wants to test launchctl in a sandbox HOME
+ * and is prepared to clean up themselves).
+ */
+function normalizeOptsForSandbox(opts: WizardOptions): WizardOptions {
+  // Only apply when caller passed explicit home AND it differs from real home.
+  if (!opts.home) return opts;
+  const realHome = os.homedir();
+  if (opts.home === realHome) return opts;
+  if (process.env.MAVIS_PET_FORCE_LAUNCHD === '1') return opts;
+  // Caller already explicitly set noLaunchd — don't override their choice.
+  if (opts.noLaunchd !== undefined) return opts;
+  console.log(
+    kleur.dim(
+      `[sandbox] opts.home=${opts.home} != real home=${realHome} → ` +
+      `auto-set noLaunchd=true (set MAVIS_PET_FORCE_LAUNCHD=1 to override).`,
+    ),
+  );
+  return { ...opts, noLaunchd: true };
+}
+
+/**
  * Run the full 7-step wizard. Returns the per-step results so callers
  * (mainly tests) can assert on them. The function never throws — it
  * coerces all step failures into StepResult{status: 'error'}.
  */
 export async function runInstallWizard(opts: WizardOptions = {}): Promise<StepResult[]> {
+  opts = normalizeOptsForSandbox(opts);
   const moduleDir = path.dirname(fileURLToPath(import.meta.url));
   const results: StepResult[] = [];
 
@@ -604,6 +642,7 @@ export async function runInstallWizard(opts: WizardOptions = {}): Promise<StepRe
  *   considered installer-managed)
  */
 export async function runUninstall(opts: WizardOptions = {}): Promise<StepResult[]> {
+  opts = normalizeOptsForSandbox(opts);
   const home = opts.home ?? os.homedir();
   const results: StepResult[] = [];
 

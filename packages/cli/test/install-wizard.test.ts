@@ -428,3 +428,87 @@ describe('runUninstall', () => {
     expect(bootoutCall[1]).toContain(LAUNCHD_LABEL);
   });
 });
+
+// v0.7.1 — verifier orphan floater bug: when a verifier ran the wizard in
+// a sandbox HOME (/var/folders/T/mavis-pet-verify-XXX) without explicitly
+// passing noLaunchd:true, the wizard would happily `launchctl bootstrap`
+// the agent for the user's REAL gui session, spawning a real broker +
+// floater that connected to the user's real desktop and stayed there
+// after the sandbox HOME got rm -rf'd. Two orphan floater windows showed
+// up next to the user's real pet.
+//
+// Fix: normalizeOptsForSandbox auto-sets noLaunchd=true when opts.home
+// differs from the real os.homedir() AND the caller didn't explicitly
+// pass noLaunchd. These tests pin that behavior.
+describe('runInstallWizard — sandbox auto-detect (v0.7.1)', () => {
+  let tmpHome: string;
+  let fakeFloater: string;
+  beforeEach(() => {
+    tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'mavis-pet-sandbox-'));
+    fakeFloater = path.join(tmpHome, 'fake-floater');
+    fs.writeFileSync(fakeFloater, '#!/bin/sh\necho fake', { mode: 0o755 });
+  });
+  afterEach(() => {
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+  });
+
+  it('auto-skips launchctl when opts.home != real homedir and noLaunchd unset', async () => {
+    const { fn, calls } = makeMockLaunchctl();
+    const results = await runInstallWizard({
+      home: tmpHome,                         // sandbox HOME, NOT noLaunchd
+      skipWelcome: true,
+      floaterSource: fakeFloater,
+      skipHealthz: true,
+      launchctl: fn,
+    });
+    // launchctl mock should NEVER have been invoked — auto-detect kicked in.
+    expect(calls.length).toBe(0);
+    // Step 7 should report "skip" with the auto-set noLaunchd flag visible.
+    const step7 = results.find((r) => r.step === 7);
+    expect(step7?.status).toBe('skip');
+    expect(step7?.message).toMatch(/noLaunchd=true/);
+  });
+
+  it('does NOT auto-skip when MAVIS_PET_FORCE_LAUNCHD=1 (escape hatch)', async () => {
+    const { fn, calls } = makeMockLaunchctl();
+    process.env.MAVIS_PET_FORCE_LAUNCHD = '1';
+    try {
+      await runInstallWizard({
+        home: tmpHome,
+        skipWelcome: true,
+        floaterSource: fakeFloater,
+        skipHealthz: true,
+        launchctl: fn,
+      });
+    } finally {
+      delete process.env.MAVIS_PET_FORCE_LAUNCHD;
+    }
+    // Force flag set → launchctl should have been invoked normally.
+    expect(calls.length).toBeGreaterThan(0);
+    expect(calls.some((c) => c[0] === 'bootstrap')).toBe(true);
+  });
+
+  it('respects explicit noLaunchd=false even with sandbox home (caller knows what they want)', async () => {
+    const { fn, calls } = makeMockLaunchctl();
+    await runInstallWizard({
+      home: tmpHome,
+      skipWelcome: true,
+      noLaunchd: false,                      // explicitly false
+      floaterSource: fakeFloater,
+      skipHealthz: true,
+      launchctl: fn,
+    });
+    // Explicit false → auto-detect must NOT override it.
+    expect(calls.length).toBeGreaterThan(0);
+    expect(calls.some((c) => c[0] === 'bootstrap')).toBe(true);
+  });
+
+  it('runUninstall also auto-skips launchctl in sandbox home', async () => {
+    const { fn, calls } = makeMockLaunchctl();
+    await runUninstall({
+      home: tmpHome,
+      launchctl: fn,
+    });
+    expect(calls.length).toBe(0);
+  });
+});
