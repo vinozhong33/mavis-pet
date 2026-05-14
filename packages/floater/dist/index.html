@@ -308,6 +308,7 @@
             slug: p.slug, frame_w: p.frame_w, frame_h: p.frame_h,
             rows: p.rows, cols: p.cols, frame_count: p.frame_count,
             scaled: `${scaledFrameW}x${scaledFrameH}`,
+            state_rows: p.state_rows ?? '(default positional)',
           });
           petEl.style.width = `${scaledFrameW}px`;
           petEl.style.height = `${scaledFrameH}px`;
@@ -319,8 +320,17 @@
           petEl.style.setProperty('--rows', p.rows);
           petEl.style.setProperty('--frames', p.frame_count || 6);
           petEl.style.setProperty('--dur', `${p.frame_duration_ms}ms`);
+          // Resolve the row index for each mavis-pet state. When the pet
+          // payload carries an explicit `state_rows` map (e.g. petdex pets
+          // imported via mavis-pet's adapter — petdex grid order differs
+          // from mavis-pet's STATES array order), that map wins. Otherwise
+          // we fall back to the implicit "STATES idx == row idx" assumption
+          // that mikoko + future native mavis-pet sprites follow.
+          const rowMap = p.state_rows && typeof p.state_rows === 'object'
+            ? p.state_rows : null;
           STATES.forEach((s, idx) => {
-            petEl.style.setProperty(`--row-${s}-y`, `-${idx * scaledFrameH}px`);
+            const row = rowMap && Number.isInteger(rowMap[s]) ? rowMap[s] : idx;
+            petEl.style.setProperty(`--row-${s}-y`, `-${row * scaledFrameH}px`);
           });
           console.log(`[mavis-pet] loaded ${p.slug}`);
         } catch (e) {

@@ -21,6 +21,7 @@
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tauri::{Emitter, Manager};
@@ -246,6 +247,13 @@ struct PetPayload {
     frame_count: u32,
     // CSS animation duration in ms per row (idle/wave/run/failed/...)
     frame_duration_ms: u32,
+    /// Optional explicit state→row map. Lets adapters (e.g. petdex) override
+    /// the default "STATES array index = row index" assumption when the
+    /// spritesheet uses a different row order. Keys are the mavis-pet states
+    /// (idle/wave/run/jump/review/failed/extra1/extra2). When absent, the
+    /// floater falls back to the implicit positional mapping.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state_rows: Option<BTreeMap<String, u32>>,
 }
 
 fn load_pet_payload(slug_hint: Option<String>) -> Result<PetPayload, String> {
@@ -286,6 +294,7 @@ fn load_pet_payload(slug_hint: Option<String>) -> Result<PetPayload, String> {
     // remaining 2 frames per row are reserved/unused per petdex spec.
     let mut frame_count: u32 = 6;
     let mut frame_duration_ms: u32 = 1100;
+    let mut state_rows: Option<BTreeMap<String, u32>> = None;
 
     if let Ok(raw) = fs::read_to_string(dir.join("pet.json")) {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
@@ -307,6 +316,17 @@ fn load_pet_payload(slug_hint: Option<String>) -> Result<PetPayload, String> {
             if let Some(n) = v.get("frame_duration_ms").and_then(|x| x.as_u64()) {
                 frame_duration_ms = n as u32;
             }
+            if let Some(map) = v.get("state_rows").and_then(|x| x.as_object()) {
+                let mut parsed: BTreeMap<String, u32> = BTreeMap::new();
+                for (k, val) in map {
+                    if let Some(n) = val.as_u64() {
+                        parsed.insert(k.clone(), n as u32);
+                    }
+                }
+                if !parsed.is_empty() {
+                    state_rows = Some(parsed);
+                }
+            }
         }
     }
 
@@ -320,6 +340,7 @@ fn load_pet_payload(slug_hint: Option<String>) -> Result<PetPayload, String> {
         cols,
         frame_count,
         frame_duration_ms,
+        state_rows,
     })
 }
 

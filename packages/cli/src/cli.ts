@@ -26,6 +26,11 @@ import * as readline from 'node:readline';
 import * as http from 'node:http';
 import { fileURLToPath } from 'node:url';
 import kleur from 'kleur';
+import {
+  adaptPetdexPet,
+  findPetdexPet,
+  listPetdexPets,
+} from './petdex-adapter.js';
 
 const HOME = os.homedir();
 const PET_DIR = path.join(HOME, '.mavis/pets');
@@ -60,8 +65,8 @@ function loadConfig(): { active: string | null } {
 }
 function saveConfig(c: { active: string | null }) { writeJson(CONFIG_PATH, c); }
 
-function listInstalledPets(): { slug: string; dir: string; source: 'mavis' | 'codex' }[] {
-  const out: { slug: string; dir: string; source: 'mavis' | 'codex' }[] = [];
+function listInstalledPets(): { slug: string; dir: string; source: 'mavis' | 'codex' | 'petdex' }[] {
+  const out: { slug: string; dir: string; source: 'mavis' | 'codex' | 'petdex' }[] = [];
   for (const [base, source] of [[PET_DIR, 'mavis'], [CODEX_PET_DIR, 'codex']] as const) {
     if (!fs.existsSync(base)) continue;
     for (const entry of fs.readdirSync(base, { withFileTypes: true })) {
@@ -72,10 +77,30 @@ function listInstalledPets(): { slug: string; dir: string; source: 'mavis' | 'co
         || fs.existsSync(path.join(dir, 'spritesheet.png'));
       if (hasPet && hasSprite) {
         if (!out.some((p) => p.slug === entry.name)) {
-          out.push({ slug: entry.name, dir, source });
+          // Detect mavis-pet entries that originated from petdex (the
+          // adapter writes `source: "petdex"` into the translated pet.json).
+          // We surface them to the user under their original origin so the
+          // status/list output makes the source obvious without a separate
+          // `~/.petdex/pets/` scan.
+          let resolvedSource: 'mavis' | 'codex' | 'petdex' = source;
+          if (source === 'mavis') {
+            try {
+              const meta = JSON.parse(fs.readFileSync(path.join(dir, 'pet.json'), 'utf8')) as { source?: string };
+              if (meta.source === 'petdex') resolvedSource = 'petdex';
+            } catch { /* ignore — still list under the directory's source */ }
+          }
+          out.push({ slug: entry.name, dir, source: resolvedSource });
         }
       }
     }
+  }
+  // Surface petdex pets that have NOT yet been adapted into ~/.mavis/pets/
+  // so the user can see what's available locally without leaving the CLI.
+  // These are read-only previews — switching to one will trigger the
+  // adapter (cmdSwitch handles the auto-install).
+  for (const p of listPetdexPets()) {
+    if (out.some((existing) => existing.slug === p.slug)) continue;
+    out.push({ slug: p.slug, dir: p.dir, source: 'petdex' });
   }
   out.sort((a, b) => a.slug.localeCompare(b.slug));
   return out;
@@ -218,6 +243,28 @@ async function cmdInstall(slug: string) {
     return;
   }
 
+  // v0.6.2: petdex pet adapter — if the user has the petdex CLI installed
+  // and has run `npx petdex install <slug>`, the pet sits in
+  // ~/.petdex/pets/<slug>/ in petdex's own layout. We adapt it (copy
+  // spritesheet + write a translated pet.json with the petdex grid's
+  // state_rows mapping) instead of going to the petdex HTTP manifest.
+  // This is the zero-network path for any pet the user already has via
+  // the petdex CLI, and it keeps mavis-pet's installed pet directory
+  // self-contained — the floater never reaches into ~/.petdex/.
+  if (findPetdexPet(slug)) {
+    console.log(kleur.dim(`adapting petdex pet '${slug}' from ~/.petdex/pets/${slug}`));
+    const dest = adaptPetdexPet(slug);
+    console.log(kleur.dim(`wrote ${path.relative(HOME, dest)}/{pet.json,spritesheet.webp}`));
+    const cfg = loadConfig();
+    if (!cfg.active) {
+      cfg.active = slug;
+      saveConfig(cfg);
+      console.log(kleur.green(`activated ${slug}`));
+    }
+    console.log(kleur.green(`installed ${slug} (petdex)`));
+    return;
+  }
+
   console.log(kleur.dim(`fetching petdex manifest...`));
   const manifest = await fetchJson(PETDEX_MANIFEST);
   const list: any[] = manifest?.pets ?? manifest;
@@ -268,15 +315,40 @@ async function cmdList() {
   }
   for (const p of pets) {
     const tag = p.slug === cfg.active ? kleur.green('★ active') : '          ';
-    const src = p.source === 'mavis' ? '~/.mavis/pets' : '~/.codex/pets';
+    let src: string;
+    if (p.source === 'petdex' && p.dir.startsWith(path.join(HOME, '.petdex'))) {
+      // Available via the petdex CLI but not yet adapted into ~/.mavis/pets.
+      // Tell the user it's a one-step away.
+      src = `${kleur.dim('~/.petdex/pets')} ${kleur.yellow('(switch to import)')}`;
+    } else if (p.source === 'petdex') {
+      src = `~/.mavis/pets ${kleur.cyan('(petdex)')}`;
+    } else if (p.source === 'codex') {
+      src = '~/.codex/pets';
+    } else {
+      src = '~/.mavis/pets';
+    }
     console.log(`${tag}  ${p.slug.padEnd(20)}  ${kleur.dim(src)}`);
   }
 }
 
 async function cmdSwitch(slug: string) {
   if (!slug) throw new Error('usage: mavis-pet switch <slug>');
-  const pets = listInstalledPets();
-  if (!pets.find((p) => p.slug === slug)) {
+  let pets = listInstalledPets();
+  let entry = pets.find((p) => p.slug === slug);
+  // v0.6.2 — if the slug isn't in ~/.mavis/pets/ or ~/.codex/pets/ but the
+  // user has it in ~/.petdex/pets/, auto-adapt it now so `switch` is a
+  // single command. Without this users would have to run
+  // `mavis-pet install <slug>` after every `petdex install <slug>`.
+  if (!entry || entry.source === 'petdex') {
+    if (findPetdexPet(slug)) {
+      console.log(kleur.dim(`'${slug}' not yet adapted — importing from petdex…`));
+      const dest = adaptPetdexPet(slug);
+      console.log(kleur.dim(`wrote ${path.relative(HOME, dest)}/{pet.json,spritesheet.webp}`));
+      pets = listInstalledPets();
+      entry = pets.find((p) => p.slug === slug);
+    }
+  }
+  if (!entry) {
     throw new Error(`pet '${slug}' is not installed (mavis-pet install ${slug})`);
   }
   const cfg = loadConfig();
