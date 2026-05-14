@@ -199,7 +199,11 @@ export function checkBrokerHealth(port: number, timeoutMs = 1000): Promise<boole
  *   4. dev workspace: <packages/floater/target/release/mavis-pet-floater>
  *      (relative to this module — works in dev when cli.ts and floater
  *       live in the same monorepo)
- *   5. bundled: <packages/cli/dist/../floater-binary> (future: shipped in npm tarball)
+ *   5. arch-aware bundled: <packages/cli/assets/floater-binary/<platform>-<arch>/mavis-pet-floater>
+ *      (this path IS in the npm tarball via package.json `files: ["assets"]`,
+ *       so v0.7.0+ npm install ships the floater binary out of the box).
+ *   6. legacy bundled: <packages/cli/floater-binary/mavis-pet-floater>
+ *      (kept for compat in case someone shipped this layout in 0.6.x)
  * Returns null if none found.
  */
 export function locateFloaterBinary(opts: { home: string; floaterSource?: string; moduleDir: string }): string | null {
@@ -208,6 +212,10 @@ export function locateFloaterBinary(opts: { home: string; floaterSource?: string
   if (process.env.MAVIS_PET_FLOATER) candidates.push(process.env.MAVIS_PET_FLOATER);
   candidates.push(path.join(opts.home, '.mavis/pet/floater'));
   candidates.push(path.resolve(opts.moduleDir, '../../floater/target/release/mavis-pet-floater'));
+  // v0.7.0: arch-aware bundled binary, shipped in npm tarball under assets/.
+  // process.arch on Apple Silicon = "arm64"; process.platform on macOS = "darwin".
+  const archDir = `${process.platform}-${process.arch}`;
+  candidates.push(path.resolve(opts.moduleDir, `../assets/floater-binary/${archDir}/mavis-pet-floater`));
   candidates.push(path.resolve(opts.moduleDir, '../floater-binary/mavis-pet-floater'));
   for (const c of candidates) {
     try {
