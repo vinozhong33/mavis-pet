@@ -355,6 +355,31 @@ export function createEventSource(opts: EventSourceOptions): EventSourceHandle {
     return flat.slice(0, max - 1) + "…";
   }
 
+  /**
+   * v0.6.1.2 — Pick the "tail" of a long message for the floater card.
+   * The card's two-line subtitle area shows ~80 chars max, and for
+   * multi-paragraph replies (think: producer summary) the user wants
+   * to see the LATEST chunk, not the opening sentence — that opening
+   * is already 30 minutes stale by the time you glance at the card.
+   *
+   * Heuristic: if the message has paragraph breaks (\n\n) or
+   * sentence terminators (。！？.!?), grab the last chunk that
+   * fits in `max`. Otherwise fall back to a hard tail-slice with
+   * a leading ellipsis to signal "this is the end of something
+   * longer".
+   */
+  function tailOf(s: string, max: number): string {
+    const flat = s.replace(/\s+/g, " ").trim();
+    if (flat.length <= max) return flat;
+    // Prefer last sentence boundary that still fits.
+    const tail = flat.slice(-max);
+    const m = tail.match(/[。！？\.!?\n]\s*([^。！？\.!?\n]+)$/);
+    if (m && m[1] && m[1].length >= 8) {
+      return "…" + m[1].trim();
+    }
+    return "…" + tail.slice(1);
+  }
+
   async function handleEvent(name: string, data: unknown): Promise<void> {
     // Filter high-frequency noise: fs.* / system.* / config.* / heartbeat.
     if (
@@ -467,7 +492,10 @@ export function createEventSource(opts: EventSourceOptions): EventSourceHandle {
             sess.currentAction = undefined;
             const preview = (payload as { textPreview?: string }).textPreview;
             if (typeof preview === "string" && preview.trim()) {
-              sess.lastMessage = truncate(preview, maxMessageChars);
+              // v0.6.1.2 — show the TAIL of the streaming text. textPreview
+              // grows monotonically over a turn; the user wants to see the
+              // current paragraph being typed, not the opening sentence.
+              sess.lastMessage = tailOf(preview, maxMessageChars);
             }
             break;
           }
@@ -485,7 +513,10 @@ export function createEventSource(opts: EventSourceOptions): EventSourceHandle {
             sess.currentAction = undefined;
             const finalMsg = (payload as { finalMessage?: string }).finalMessage;
             if (typeof finalMsg === "string" && finalMsg.trim()) {
-              sess.lastMessage = truncate(finalMsg, maxMessageChars);
+              // v0.6.1.2 — finalMessage is the full assistant reply for the
+              // turn. Use tail so the user sees the closing paragraph (the
+              // actual conclusion / next step) instead of the opening recap.
+              sess.lastMessage = tailOf(finalMsg, maxMessageChars);
             }
             // Turn end implies any pending perm resolved one way or the other.
             opts.onPermissionResolved?.(sid);
