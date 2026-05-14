@@ -122,6 +122,23 @@
         align-items: center;
         gap: 6px;
       }
+      /* v0.7.2 — restored from v0.4.4 design. 22x22 rounded-square logo
+       * tile (mavis app icon) at the left of each card title. Anchors
+       * the card visually + makes it instantly recognizable as a mavis
+       * task card vs anything else on the desktop. v0.6.1 multi-card
+       * rewrite accidentally dropped this slot when the row was
+       * simplified to [title, icon-slot] — vino noticed and asked
+       * for it back. */
+      .card-badge {
+        flex: 0 0 22px;
+        width: 22px;
+        height: 22px;
+        border-radius: 6px;
+        background-image: url("badge.png");
+        background-size: cover;
+        background-position: center;
+        background-repeat: no-repeat;
+      }
       .card-title {
         flex: 1 1 auto;
         min-width: 0;
@@ -375,6 +392,12 @@
         const row = document.createElement('div');
         row.className = 'card-row';
 
+        // v0.7.2 — restored 22x22 mavis logo badge to the left of title.
+        const badge = document.createElement('span');
+        badge.className = 'card-badge';
+        badge.setAttribute('aria-hidden', 'true');
+        row.appendChild(badge);
+
         const titleEl = document.createElement('span');
         titleEl.className = 'card-title';
         // title preference: real session title > agent display name >
@@ -438,10 +461,30 @@
       // Already-present cards stay (just data-update); new cards get inserted
       // with .show next tick (so the CSS transition fires); removed cards get
       // .leaving + setTimeout unmount.
+      //
+      // v0.7.2 — Skip the entire DOM pass when the snapshot is byte-identical
+      // to the last render. Multiple concurrent sessions all streaming text
+      // cause broker to push 5+ "sessions" messages per second; without this
+      // dirty-check every push triggers appendChild on every card (line 487)
+      // which forces a layout reflow even when nothing visible changed.
+      // Vino reported the cards visibly jittering up/down — that was the
+      // 200ms throttle ticks landing as DOM reflows. Now: stringify the
+      // ordered cards into a stable key, compare to previous, no-op on match.
+      let lastRenderKey = '';
       function renderCards() {
         // Sort sessions by lastEventTs descending (most recent on top).
         const ordered = Array.from(sessionsBySid.values())
           .sort((a, b) => (b.lastEventTs || 0) - (a.lastEventTs || 0));
+
+        // Build a stable key of the visible state. Include only fields that
+        // actually drive the DOM: id, status, currentAction, lastMessage,
+        // title, agentName. Exclude lastEventTs (it changes constantly but
+        // doesn't change rendering).
+        const renderKey = ordered.map(c =>
+          `${c.sessionId}|${c.status || ''}|${c.currentAction || ''}|${c.title || ''}|${c.agentName || ''}|${c.lastMessage || ''}`
+        ).join('||');
+        if (renderKey === lastRenderKey) return;
+        lastRenderKey = renderKey;
 
         const seenSids = new Set();
         // Rebuild DOM in-order (DOM children re-arranged in place by appendChild
@@ -460,8 +503,14 @@
             // Update existing card's content in-place (avoid full rebuild —
             // would lose hover state / ongoing transitions).
             updateCard(el, card);
-            // Re-anchor in DOM so the order matches sort.
-            cardsEl.appendChild(el);
+            // v0.7.2 — Only re-anchor when the DOM order actually differs
+            // from the desired order. appendChild on a node already at the
+            // right position still triggers reflow, so we skip when noop.
+            const desiredIdx = Array.from(seenSids).length - 1;
+            const currentIdx = Array.from(cardsEl.children).indexOf(el);
+            if (currentIdx !== desiredIdx) {
+              cardsEl.appendChild(el);
+            }
           }
         }
 
