@@ -296,6 +296,11 @@ export function createEventSource(opts: EventSourceOptions): EventSourceHandle {
         // v0.6 main path — daemon-pushed live phase signal.
         const payload = extractPayload(data);
         const phase = (payload as { phase?: string })?.phase;
+        log?.debug("status_update_received", {
+          sid,
+          phase,
+          tool: (payload as { tool?: string }).tool,
+        });
         switch (phase) {
           case "thinking": {
             // Turn started; no tool/text yet. Clear lastMessage so the
