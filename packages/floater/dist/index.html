@@ -52,8 +52,11 @@
         display: flex;
         flex-direction: column;
         gap: 6px;
-        max-width: 320px;     /* hard cap — long titles never push out */
-        width: max-content;
+        /* v0.6.1.1 — fixed width (was max-content with max-cap, but that
+         * made each card breathe to its own content length and the column
+         * visually jittered card-to-card / between renders. Vino noticed.
+         * Lock to 320px so the stack reads as one consistent column. */
+        width: 320px;
         max-height: 100%;
         overflow: visible;
         pointer-events: auto;
@@ -76,7 +79,9 @@
         opacity: 0;
         transform: translateY(4px);
         transition: opacity 300ms ease-out, transform 300ms ease-out;
-        max-width: 320px;
+        /* v0.6.1.1 — fixed width on parent .cards-stack, individual cards
+         * fill 100% of stack so the column reads consistent. */
+        width: 100%;
         box-sizing: border-box;
         pointer-events: auto;
       }
@@ -94,9 +99,15 @@
         border-color: rgba(0, 0, 0, 0.12);
       }
       .card.finished {
-        opacity: 0.78;
+        /* v0.6.1.1 — was opacity:0.78 but that made the whole card blend
+         * with the desktop bg (vino noticed the bottom transparent halo).
+         * Keep card fully opaque; convey "finished" via the green check
+         * icon + slightly muted title color. */
+        color: #4a4a4a;
       }
-      .card.finished:hover { opacity: 1; }
+      .card.finished .card-title { color: #4a4a4a; }
+      .card.finished:hover { color: #1a1a1a; }
+      .card.finished:hover .card-title { color: #1a1a1a; }
       /* v0.6.1 (Bug 2) — waiting_perm visual cue: amber left border +
        * darker background tint. Catches the user's eye so they notice
        * "this session is blocked on me". */

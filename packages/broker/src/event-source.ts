@@ -202,6 +202,122 @@ export function createEventSource(opts: EventSourceOptions): EventSourceHandle {
     }
   }
 
+  /**
+   * v0.6.1.1 — On SSE (re)connect, walk the daemon agent list and pull each
+   * agent's currently-active sessions (status.type === "started") into our
+   * local sessionsBySid map. Without this, a daemon restart leaves broker
+   * with an empty cache and the floater shows nothing until the next
+   * status_update event happens to fire — meaning the user can be staring
+   * at an empty stack while sessions are clearly running and even waiting
+   * on permission.
+   *
+   * Limitation: daemon doesn't persist transient per-turn fields like
+   * currentAction / lastMessage anywhere queryable, so reseeded cards have
+   * just title + agentName. The next status_update event for that session
+   * fills in the live phase. That's a tolerable compromise — the user
+   * sees "something is running" immediately even if we can't say what.
+   */
+  async function reseedActiveSessions(): Promise<void> {
+    try {
+      const agentsRes = await fetchImpl(`${baseUrl}/mavis/api/agent`);
+      if (!agentsRes.ok) return;
+      const agents = (await agentsRes.json()) as Array<{
+        name: string;
+        displayName?: string;
+      }>;
+      if (!Array.isArray(agents)) return;
+
+      const now = opts.clock.now();
+      let added = 0;
+
+      for (const agent of agents) {
+        if (!agent?.name) continue;
+        try {
+          const url = `${baseUrl}/mavis/api/agent/${encodeURIComponent(
+            agent.name,
+          )}/session?limit=20`;
+          const r = await fetchImpl(url);
+          if (!r.ok) continue;
+          const body = (await r.json()) as {
+            sessions?: Array<{
+              sessionId: string;
+              title?: string;
+              displayName?: string;
+              agentName?: string;
+              status?: { type?: string };
+              updatedAt?: number;
+            }>;
+          };
+          const list = body?.sessions ?? [];
+          for (const s of list) {
+            // Only seed currently-running sessions; finished ones either
+            // already evicted via the 30s timer or never matter.
+            if (s?.status?.type !== "started") continue;
+            if (!s.sessionId || sessions.has(s.sessionId)) continue;
+
+            const sess: ActiveSession = {
+              sessionId: s.sessionId,
+              lastTouchedAt: typeof s.updatedAt === "number" ? s.updatedAt : now,
+              status: "started",
+              title: s.title,
+              displayName: s.displayName ?? s.agentName ?? agent.displayName,
+            };
+            sessions.set(s.sessionId, sess);
+            added++;
+          }
+        } catch (err) {
+          log?.debug("reseed_agent_failed", {
+            agent: agent.name,
+            err: (err as Error).message,
+          });
+        }
+      }
+
+      if (added > 0) {
+        log?.info("reseeded_active_sessions", { added, total: sessions.size });
+        onSessionUpdate?.();
+      }
+
+      // v0.6.1.1 — Also pull pending perm requests and stamp the
+      // affected sessions' currentAction so the amber clock visual
+      // appears immediately (without it, reseeded cards just show the
+      // default spinner until the next status_update event).
+      try {
+        const permRes = await fetchImpl(
+          `${baseUrl}/mavis/api/permission/requests`,
+        );
+        if (permRes.ok) {
+          const permBody = (await permRes.json()) as {
+            requests?: Array<{ sessionId?: string; requestId?: string }>;
+          };
+          const reqs = permBody?.requests ?? [];
+          let stamped = 0;
+          for (const req of reqs) {
+            if (!req?.sessionId) continue;
+            const s = sessions.get(req.sessionId);
+            if (!s) continue;
+            // Only stamp if not already showing something more specific.
+            if (s.currentAction !== "等待审批") {
+              s.currentAction = "等待审批";
+              cancelEvict(s);
+              stamped++;
+            }
+          }
+          if (stamped > 0) {
+            log?.info("reseeded_pending_perms", { stamped });
+            onSessionUpdate?.();
+          }
+        }
+      } catch (err) {
+        log?.debug("reseed_perms_failed", {
+          err: (err as Error).message,
+        });
+      }
+    } catch (err) {
+      log?.warn("reseed_failed", { err: (err as Error).message });
+    }
+  }
+
   // -------------------------------------------------------------------------
   // Per-event handlers.
   // -------------------------------------------------------------------------
@@ -449,6 +565,12 @@ export function createEventSource(opts: EventSourceOptions): EventSourceHandle {
         }
         log?.info("event_source_connected", { url });
         backoff = initialBackoffMs;
+        // v0.6.1.1 — On every (re)connect, walk the agent/session API and
+        // populate sessionsBySid with currently-running sessions so the
+        // floater shows them immediately, even if no status_update event
+        // fires for a while. Fire-and-forget; reseed errors are logged but
+        // don't break the SSE consumer.
+        void reseedActiveSessions();
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
         let buf = "";
