@@ -1,39 +1,27 @@
 /**
- * Pet Broker — mavis daemon SSE consumer.
+ * Pet Broker — daemon SSE consumer (v0.6).
  *
- * v0.4.2 — replaces the v0.3 polling-only pipeline with a real-time push
- * channel sourced from the daemon's `GET /mavis/api/events` endpoint. SSE
- * gives us the missing pieces the perm-poller can't provide:
- *   - active session pool (which sessions are currently running, with title)
- *   - real-time message text (for the floater task-card subtitle)
+ * v0.6 PIVOT: subscribes to the new `session.status_update` SSE event
+ * (https://gitlab.xaminim.com/matrix/agent-archon!1748) which exposes the
+ * full per-turn live phase (thinking / calling_tool / streaming_text /
+ * waiting_perm / done) inline. This replaces the previous Frankenstein
+ * stack that combined:
  *
- * The state machine still owns "what state should the pet be in" (driven by
- * hook events posted to /event from the mavis hook payloads). This module
- * only feeds **side-channel display data** (title + last message) into a pool
- * the server.ts reads at broadcast time.
+ *   - `permission.ask` SSE       → perm-pending detection
+ *   - 1.5s message polling       → lastMessage streaming preview
+ *   - PreToolUse hook → broker   → currentAction tool-name display
+ *   - 5s perm-poller diff        → perm-resolved detection
  *
- * Why we don't use the browser EventSource API:
- *   - Node 18+ has it, but typings/headers control is awkward.
- *   - We want a tiny, dependency-free SSE parser we can unit-test.
+ * v0.6 broker: subscribe `session.status_update`, switch on `phase`, render.
+ * Net cuts ~250 LOC of glue, removes per-session HTTP polling, and lifts
+ * latency from ~1.5s to <200ms.
  *
- * Wire protocol (assumed daemon SSE shape, based on user-memory note
- * "GET /mavis/api/events — run_status_changed / message_update / message_end /
- * session.new etc."):
- *
- *   event: run_status_changed
- *   data: {"sessionId":"ses_xxx","status":"started"}
- *
- *   event: message_update
- *   data: {"sessionId":"ses_xxx","content":"...","role":"assistant"}
- *
- *   event: message_end
- *   data: {"sessionId":"ses_xxx","content":"..."}
- *
- *   event: session.new
- *   data: {"sessionId":"ses_xxx"}
- *
- * If real daemon fields differ, all extraction is defensive (typeof checks +
- * fallback chain) and unknown events are debug-logged, not fatal.
+ * Compatibility: REQUIRES daemon with `session.status_update` event
+ * (https://gitlab.xaminim.com/matrix/agent-archon!1748 merged 2026-05-14).
+ * Older daemons emit only lifecycle events — broker will receive
+ * session.start / session.finish but no thinking/calling_tool/streaming_text
+ * signals, so the floater card title shows but subtitle stays empty.
+ * Users on old daemon should stay on mavis-pet v0.4.4.
  */
 
 import type { Clock, TimerHandle } from "./clock.js";
@@ -45,70 +33,44 @@ const DEFAULT_DAEMON_URL =
 /** Subset of session info we cache for the floater task card. */
 export interface ActiveSession {
   sessionId: string;
-  /** Cached from `/mavis/api/session/<sid>` after first 'started' event. */
+  /** Cached from `/mavis/api/session/<sid>` after first session.start event. */
   title?: string;
-  /**
-   * v0.4.3 — Cached agent display name from `/mavis/api/session/<sid>`
-   * (`displayName` field, fallback to `agentName`). Used as fallback when
-   * `title` is empty (e.g. agent root session that hasn't been named by
-   * the LLM yet — surface "mavis健康" instead of empty title).
-   */
+  /** Agent display name (e.g. "mavis健康") — fallback when title is empty. */
   displayName?: string;
-  /** Cached from `/mavis/api/session/<sid>/message?limit=1` (≤ 80 chars). */
+  /** Latest streaming preview / final reply preview (≤ 80 chars). */
   lastMessage?: string;
-  /** Last known SSE status: 'started' | 'finished' | other (raw). */
+  /** Last known status: 'started' | 'finished' | other. */
   status?: string;
   /** ms ts of the last event that touched this session. */
   lastTouchedAt: number;
   /** When non-null, an evict timer scheduled for this session. */
   evictTimer?: TimerHandle | null;
   /**
-   * v0.4.3 — true for cron-triggered sessions (purpose starts with 'cron:').
-   * The floater hides these from the task card; vino only cares about
-   * sessions they themselves prompted.
+   * True for cron-triggered sessions (purpose starts with 'cron:').
+   * The floater hides these from the task card.
    */
   hidden?: boolean;
   /**
-   * v0.4.3 — short Chinese verb describing what the session is currently
-   * doing during a streaming turn. Updated by the broker when it observes
-   * PreToolUse hook events ("执行命令" for bash, "搜索代码" for grep, etc.).
-   * Cleared on session.finish so the card switches to the real lastMessage.
-   * When set, the floater shows this string as subtitle instead of
-   * lastMessage — semantically "live status" vs "final reply preview".
+   * Short Chinese verb describing what the session is currently doing.
+   * Sourced from `session.status_update` phase:
+   *   - thinking → "正在思考"
+   *   - calling_tool → "正在使用 <tool 中文名>"
+   *   - streaming_text / done → undefined (subtitle uses lastMessage instead)
+   *   - waiting_perm → "等待审批"
    */
   currentAction?: string;
-  /**
-   * v0.4.3 — interval handle for the lastMessage poller running while
-   * status === "started". Polls daemon every 1.5s so the floater card
-   * subtitle reflects live streaming output. Cleared on session.finish.
-   */
-  pollTimer?: TimerHandle | null;
-  /**
-   * v0.4.4 — minimum daemon-message timestamp to accept into `lastMessage`.
-   * Set to `clock.now()` on every session.start so the polling loop's
-   * first fetch (which races against the daemon producing the new turn's
-   * first assistant chunk) doesn't pull the previous turn's final reply
-   * back in and reanimate stale "done" text on the card. Once a fresh
-   * assistant chunk lands (timestamp > this), it overwrites lastMessage
-   * normally.
-   */
-  lastTurnStartTimestamp?: number;
 }
 
 export interface EventSourceOptions {
   clock: Clock;
-  /** Daemon URL, e.g. http://127.0.0.1:15321. Default reads MAVIS_DAEMON_URL. */
+  /** Daemon URL (no trailing slash, no /mavis suffix). */
   daemonUrl?: string;
   logger?: Logger;
-  /**
-   * Inject a custom fetch impl for tests. Default: global `fetch`. The fetch
-   * must support AbortSignal and return a streaming Response with body.
-   */
+  /** Inject a custom fetch impl for tests. */
   fetchImpl?: typeof fetch;
   /**
    * ms to wait after a session goes 'finished' before evicting it from the
-   * pool. Default 5 minutes — gives the floater time to keep showing the
-   * "done!" card briefly even after the session ends.
+   * pool. Default 0 — sticky until floater POST /dismiss explicitly.
    */
   evictAfterMs?: number;
   /** Initial reconnect backoff ms. Default 500. */
@@ -118,182 +80,145 @@ export interface EventSourceOptions {
   /** Max chars for `lastMessage` (truncated). Default 80. */
   maxMessageChars?: number;
   /**
-   * v0.4.3 — fired whenever a session's title / lastMessage / status changes.
-   * broker uses this to push a fresh WS state message even when the broker
-   * state machine itself didn't transition (SSE is a side channel that
-   * doesn't go through hook events). Pass null to disable (e.g. tests).
+   * Fired whenever a session's title / lastMessage / status changes so the
+   * server can re-broadcast a fresh WS state message. Pass null in tests.
    */
   onSessionUpdate?: () => void;
   /**
-   * v0.4.4 — fired when daemon emits `permission.ask` SSE event for a
-   * session, replacing the old 1.5s perm-poller as the primary "perm
-   * pending" signal source. Server wires this to
-   * `machine.ingest({kind: "PermissionRequested", sessionId})`. The
-   * perm-poller is retained only as a `PermissionResolved` detector
-   * (daemon does NOT emit a corresponding `permission.resolved` event,
-   * so we still need to diff the pending list to learn when an ask is
-   * answered). Pass null to disable (e.g. tests).
+   * v0.6 — fired when daemon emits `session.status_update phase=waiting_perm`.
+   * Server wires this to `machine.ingest({kind:"PermissionRequested",sessionId})`.
    */
-  onPermissionAsk?: (sessionId: string, requestId?: string) => void;
+  onPermissionRequested?: (sessionId: string, requestId?: string) => void;
+  /**
+   * v0.6 — fired when an active perm wait should be considered resolved.
+   * Triggered by `phase=calling_tool` (tool started → perm allowed) and
+   * `phase=done` (turn ended → any pending perm resolved one way or another).
+   * Server wires this to `machine.ingest({kind:"PermissionResolved",sessionId})`.
+   */
+  onPermissionResolved?: (sessionId: string) => void;
 }
 
 export interface EventSourceHandle {
-  /** Open SSE connection (and start reconnect loop). Idempotent if already started. */
   start(): void;
-  /** Stop SSE consumer; closes the inflight stream. Idempotent. */
   stop(): void;
-  /** Snapshot of currently-tracked sessions. Returns a new Map (caller mutation safe). */
   getActiveSessions(): Map<string, ActiveSession>;
-  /** Number of currently tracked sessions (cheap accessor). */
   activeCount(): number;
   /**
-   * v0.4.3 — set live action description for a session. Called by broker
-   * server.ts when it observes hook events (PreToolUse → tool name verb).
-   * If session not in pool yet, pre-creates an entry. Triggers
-   * onSessionUpdate so the floater immediately re-broadcasts.
+   * Explicitly evict the session whose card the floater just dismissed
+   * (POST /dismiss). Pass null to evict the most-recently-touched
+   * non-hidden session.
    */
-  markAction(sid: string, action: string | null): void;
-  /**
-   * v0.4.3 — explicitly evict the session whose card the user just dismissed
-   * (POST /dismiss from floater). Pass null to evict the most-recently-touched
-   * non-hidden session (the one currently shown in the card).
-   */
-  dismissCurrent(): void;
-  /**
-   * Test/diagnostic hook — resolves once every in-flight event handler
-   * (including its inner fetch chain to `/session/<sid>` and
-   * `/session/<sid>/message`) has settled. Production code does not need
-   * this; tests use it to deflake assertions that depend on title /
-   * lastMessage being populated.
-   */
+  dismissCurrent(sessionId: string | null): void;
+  /** Wait for in-flight handlers to settle (test helper). */
   whenIdle(): Promise<void>;
 }
 
-/**
- * Public factory. Lazy: constructing does NOT open the stream — call `start()`.
- */
+/** Map daemon tool name → short Chinese verb for currentAction. */
+function toolNameZh(tool: string | undefined): string | undefined {
+  if (!tool) return undefined;
+  const map: Record<string, string> = {
+    bash: "执行命令",
+    read: "读取文件",
+    write: "写入文件",
+    edit: "编辑文件",
+    glob: "查找文件",
+    grep: "搜索代码",
+    webfetch: "查阅网页",
+    web_search: "搜索网络",
+    task: "调度子任务",
+    todowrite: "更新任务列表",
+    skill: "加载技能",
+    mavis_communication_send: "向其他 session 发消息",
+  };
+  return map[tool.toLowerCase()] ?? `调用 ${tool}`;
+}
+
 export function createEventSource(opts: EventSourceOptions): EventSourceHandle {
   const baseUrl = opts.daemonUrl ?? DEFAULT_DAEMON_URL;
-  const eventsUrl = `${baseUrl}/mavis/api/events`;
   const fetchImpl = opts.fetchImpl ?? fetch;
-  const log = opts.logger;
-  // v0.4.3 — default 0 disables auto-eviction. Done cards stick around
-  // until the user explicitly dismisses (floater POST /dismiss on hover).
-  // Tests / advanced configs can pass a positive ms to opt back into the
-  // pre-v0.4.3 5-minute auto-evict behavior.
   const evictAfterMs = opts.evictAfterMs ?? 0;
   const initialBackoffMs = opts.initialBackoffMs ?? 500;
   const maxBackoffMs = opts.maxBackoffMs ?? 30_000;
   const maxMessageChars = opts.maxMessageChars ?? 80;
+  const log = opts.logger;
   const onSessionUpdate = opts.onSessionUpdate;
 
   const sessions = new Map<string, ActiveSession>();
-  let started = false;
+  let abortController: AbortController | null = null;
   let stopped = false;
-  let abortCtrl: AbortController | null = null;
-  let reconnectTimer: TimerHandle | null = null;
-  let backoffMs = initialBackoffMs;
-  /** Tracks every async event handler so tests can await idle. */
-  const inflight = new Set<Promise<void>>();
+  let started = false;
+  let backoff = initialBackoffMs;
+  let pendingHandlers = 0;
+  let idleResolvers: Array<() => void> = [];
+
+  function bumpHandler(): void {
+    pendingHandlers++;
+  }
+  function settleHandler(): void {
+    pendingHandlers--;
+    if (pendingHandlers === 0 && idleResolvers.length) {
+      const fns = idleResolvers;
+      idleResolvers = [];
+      for (const fn of fns) fn();
+    }
+  }
 
   // -------------------------------------------------------------------------
-  // Daemon HTTP fetch helpers — fetch session info / latest message.
+  // HTTP helpers — title / displayName lookup (no message polling in v0.6).
   // -------------------------------------------------------------------------
 
-  async function fetchSessionTitle(sid: string): Promise<{ title?: string; displayName?: string } | undefined> {
+  async function fetchSessionTitle(
+    sid: string,
+  ): Promise<{ title?: string; displayName?: string } | undefined> {
     try {
       const r = await fetchImpl(`${baseUrl}/mavis/api/session/${sid}`);
       if (!r.ok) return undefined;
-      const j = (await r.json()) as { session?: { title?: unknown; displayName?: unknown; agentName?: unknown } };
-      // v0.4.3 — daemon wraps result in `{session: {...}}` envelope.
-      const sess = j?.session ?? (j as unknown as { title?: unknown; displayName?: unknown; agentName?: unknown });
-      const out: { title?: string; displayName?: string } = {};
-      if (sess && typeof sess === "object") {
-        const t = (sess as { title?: unknown }).title;
-        if (typeof t === "string" && t.trim()) out.title = t.trim();
-        const d = (sess as { displayName?: unknown }).displayName;
-        if (typeof d === "string" && d.trim()) {
-          out.displayName = d.trim();
-        } else {
-          // Fallback to agentName (raw agent id) if no displayName.
-          const a = (sess as { agentName?: unknown }).agentName;
-          if (typeof a === "string" && a.trim()) out.displayName = a.trim();
-        }
-      }
-      return Object.keys(out).length ? out : undefined;
-    } catch (err) {
-      log?.debug("event_source_fetch_session_failed", {
-        sid,
-        err: (err as Error).message,
-      });
+      const j = (await r.json()) as { session?: { title?: string; displayName?: string; agentName?: string } };
+      const s = j?.session ?? undefined;
+      if (!s) return undefined;
+      return { title: s.title, displayName: s.displayName ?? s.agentName };
+    } catch {
+      return undefined;
     }
-    return undefined;
-  }
-
-  async function fetchLatestMessage(
-    sid: string,
-    minTimestamp?: number,
-  ): Promise<string | undefined> {
-    try {
-      // v0.4.3 — pull a small batch (5) and pick the most-recent
-      // ASSISTANT message that has actual text content. We can't ask for
-      // limit=1 because the most-recent is often a tool_call (msg_type=2,
-      // tool_calls only, no text) or a user message — both have nothing
-      // to show. The daemon real schema is `{role, msg_type, msg_content,
-      // tool_calls, timestamp, ...}`; assistant msg_type=1 is pure text,
-      // msg_type=2 may be tool_call with optional msg_content commentary.
-      //
-      // v0.4.4 — `minTimestamp` (optional): when set, skip any message
-      // whose timestamp <= minTimestamp. Used by `startMessagePolling` to
-      // avoid pulling the previous turn's final reply during the race
-      // window between session.start and the new turn's first chunk.
-      const r = await fetchImpl(
-        `${baseUrl}/mavis/api/session/${sid}/message?limit=5`,
-      );
-      if (!r.ok) return undefined;
-      const j = (await r.json()) as { messages?: unknown[] };
-      const msgs = Array.isArray(j?.messages) ? j.messages : [];
-      // Daemon returns messages in reverse-chronological order (newest first
-      // in some endpoints, oldest first in others). Sort by timestamp desc
-      // defensively, then pick first assistant with msg_content.
-      type Row = {
-        role?: string;
-        msg_content?: string;
-        timestamp?: number;
-      };
-      const sorted = (msgs as Row[])
-        .filter((m) => m && typeof m === "object")
-        .sort((a, b) => (b.timestamp ?? 0) - (a.timestamp ?? 0));
-      for (const m of sorted) {
-        if (m.role !== "assistant") continue;
-        if (typeof m.msg_content !== "string" || !m.msg_content.trim())
-          continue;
-        if (
-          typeof minTimestamp === "number" &&
-          (typeof m.timestamp !== "number" || m.timestamp <= minTimestamp)
-        ) {
-          continue;
-        }
-        return truncate(m.msg_content, maxMessageChars);
-      }
-    } catch (err) {
-      log?.debug("event_source_fetch_message_failed", {
-        sid,
-        err: (err as Error).message,
-      });
-    }
-    return undefined;
   }
 
   // -------------------------------------------------------------------------
   // Per-event handlers.
   // -------------------------------------------------------------------------
 
+  function ensureSession(sid: string, now: number): ActiveSession {
+    let s = sessions.get(sid);
+    if (!s) {
+      s = { sessionId: sid, lastTouchedAt: now };
+      sessions.set(sid, s);
+    }
+    return s;
+  }
+
+  function cancelEvict(s: ActiveSession): void {
+    if (s.evictTimer) {
+      opts.clock.clearTimeout(s.evictTimer);
+      s.evictTimer = null;
+    }
+  }
+
+  function scheduleEvict(s: ActiveSession): void {
+    cancelEvict(s);
+    if (evictAfterMs <= 0) return; // sticky — wait for /dismiss
+    s.evictTimer = opts.clock.setTimeout(() => {
+      sessions.delete(s.sessionId);
+      onSessionUpdate?.();
+    }, evictAfterMs);
+  }
+
+  function truncate(s: string, max: number): string {
+    const flat = s.replace(/\s+/g, " ").trim();
+    if (flat.length <= max) return flat;
+    return flat.slice(0, max - 1) + "…";
+  }
+
   async function handleEvent(name: string, data: unknown): Promise<void> {
-    // v0.4.3 — filter high-frequency noise events that have no per-session
-    // semantics (would inflate sessions Map + spam logs). Daemon emits
-    // fs.change for every workspace file mutation, system.* / config.* etc.
-    // Heartbeats are stripped by the SSE reader before reaching here.
+    // Filter high-frequency noise: fs.* / system.* / config.* / heartbeat.
     if (
       name.startsWith("fs.") ||
       name.startsWith("system.") ||
@@ -313,15 +238,8 @@ export function createEventSource(opts: EventSourceOptions): EventSourceHandle {
     sess.lastTouchedAt = now;
 
     switch (name) {
-      // Daemon emits these (verified via 60s SSE tap on real daemon, see
-      // v0.4.3 schema investigation). The pre-v0.4.3 broker listened for
-      // `run_status_changed` / `message_update` / `message_end` /
-      // `session.new` — NONE of those exist on /api/events.
       case "session.created": {
-        // v0.4.3 — flag cron-triggered sessions as hidden so they don't surface
-        // on the floater card. Daemon payload has `purpose: "cron:<agent>:<name>"`
-        // for cron-spawned sessions; user-prompted sessions either omit it or
-        // use a non-cron purpose string.
+        // Flag cron-triggered sessions as hidden so they don't surface on the floater card.
         const payload =
           (data && typeof data === "object" && (data as { payload?: unknown }).payload) || {};
         const purpose =
@@ -331,483 +249,279 @@ export function createEventSource(opts: EventSourceOptions): EventSourceHandle {
         if (typeof purpose === "string" && purpose.startsWith("cron:")) {
           sess.hidden = true;
         }
-        // New session — fetch title (might still be undefined; another
-        // session.title_updated will follow once the LLM names it). Also
-        // fetches displayName for fallback when title is empty.
         if (!sess.title || !sess.displayName) {
           const info = await fetchSessionTitle(sid);
           if (info?.title && !sess.title) sess.title = info.title;
           if (info?.displayName && !sess.displayName) sess.displayName = info.displayName;
         }
-        // Pull initial latest message (might be empty for fresh session).
-        const fetched = await fetchLatestMessage(sid);
-        if (fetched) sess.lastMessage = fetched;
         break;
       }
+
       case "session.start": {
-        // Turn started — equivalent to old run_status_changed:started.
+        // Lifecycle marker — set status; live status fields come from
+        // `session.status_update` events that follow.
         sess.status = "started";
-        // v0.4.3 — reset live status to "thinking" for the new turn.
-        // PreToolUse will overwrite with a more specific verb if a tool fires.
-        sess.currentAction = "正在思考";
-        // v0.4.4 — bug fix: explicitly clear the previous turn's
-        // lastMessage so the floater card stops showing stale "done"
-        // text while the new turn is mid-flight. Combined with
-        // `lastTurnStartTimestamp` below, the polling loop's first
-        // fetch (which races against daemon producing the new turn's
-        // first chunk) won't pull the prior reply back in.
-        sess.lastMessage = undefined;
-        sess.lastTurnStartTimestamp = opts.clock.now();
         cancelEvict(sess);
         if (!sess.title || !sess.displayName) {
           const info = await fetchSessionTitle(sid);
           if (info?.title && !sess.title) sess.title = info.title;
           if (info?.displayName && !sess.displayName) sess.displayName = info.displayName;
         }
-        // v0.4.3 — start 1.5s polling for live lastMessage updates so the
-        // floater card subtitle reflects the streaming reply chunk-by-chunk
-        // (daemon doesn't push tokens via /api/events).
-        startMessagePolling(sess);
         break;
       }
+
       case "session.finish": {
-        // Turn ended — equivalent to old run_status_changed:finished.
+        // Lifecycle marker — set status; the matching `session.status_update
+        // phase=done` event is the source of truth for finalMessage.
         sess.status = "finished";
-        // v0.4.3 — clear live action so subtitle falls back to real lastMessage.
         sess.currentAction = undefined;
-        // Stop polling — final message will be fetched once below.
-        stopMessagePolling(sess);
-        // Final pull of latest message (the just-completed assistant reply).
-        const fetched = await fetchLatestMessage(sid);
-        if (fetched) sess.lastMessage = fetched;
         scheduleEvict(sess);
         break;
       }
+
       case "session.title_updated": {
-        // Title changed (LLM auto-name or user rename) — pull from payload
-        // so we don't need an extra HTTP round-trip.
         const t = extractTitleFromPayload(data);
         if (t) sess.title = t;
         break;
       }
+
       case "session.compressed":
       case "session.deleted":
       case "session.abort": {
-        // Drop session immediately; no longer interesting to surface.
         sessions.delete(sid);
         break;
       }
-      case "permission.ask": {
-        // v0.4.4 — primary perm-pending signal source. Daemon emits this
-        // when a tool call hits a permission gate, before the perm-poller's
-        // 1.5s loop even gets a chance to see the new entry. We forward
-        // immediately to the broker state machine via the
-        // `onPermissionAsk` callback (server.ts wires this to
-        // `machine.ingest({kind: "PermissionRequested", sessionId})`).
-        //
-        // The perm-poller (now polling every 5s instead of 1.5s) is
-        // retained ONLY as a `PermissionResolved` detector — daemon
-        // doesn't emit a corresponding `permission.resolved` event, so
-        // we still need to diff the pending-list to learn when a perm
-        // gets answered.
-        const payload =
-          (data && typeof data === "object" && (data as { payload?: unknown }).payload) || {};
-        const requestId =
-          payload && typeof payload === "object"
-            ? (payload as { requestId?: unknown }).requestId
-            : undefined;
-        opts.onPermissionAsk?.(sid, typeof requestId === "string" ? requestId : undefined);
+
+      case "session.status_update": {
+        // v0.6 main path — daemon-pushed live phase signal.
+        const payload = extractPayload(data);
+        const phase = (payload as { phase?: string })?.phase;
+        switch (phase) {
+          case "thinking": {
+            // Turn started; no tool/text yet. Clear lastMessage so the
+            // floater stops showing the previous turn's done text while
+            // we wait for the new turn's first chunk.
+            sess.status = "started";
+            sess.currentAction = "正在思考";
+            sess.lastMessage = undefined;
+            cancelEvict(sess);
+            break;
+          }
+          case "calling_tool": {
+            sess.status = "started";
+            const tool = (payload as { tool?: string }).tool;
+            sess.currentAction = toolNameZh(tool) ?? "正在调用工具";
+            // calling_tool implies any pending perm was just allow'd
+            // (deny path doesn't fire PreToolUse).
+            opts.onPermissionResolved?.(sid);
+            break;
+          }
+          case "streaming_text": {
+            sess.status = "started";
+            // Real assistant text is now flowing — drop the "正在思考" stub.
+            sess.currentAction = undefined;
+            const preview = (payload as { textPreview?: string }).textPreview;
+            if (typeof preview === "string" && preview.trim()) {
+              sess.lastMessage = truncate(preview, maxMessageChars);
+            }
+            break;
+          }
+          case "waiting_perm": {
+            // Floater enters review state via the state machine; the card
+            // subtitle gets a "等待审批" cue while there.
+            sess.currentAction = "等待审批";
+            const reqId = (payload as { permRequestId?: string }).permRequestId;
+            opts.onPermissionRequested?.(sid, reqId);
+            break;
+          }
+          case "done": {
+            sess.status = "finished";
+            sess.currentAction = undefined;
+            const finalMsg = (payload as { finalMessage?: string }).finalMessage;
+            if (typeof finalMsg === "string" && finalMsg.trim()) {
+              sess.lastMessage = truncate(finalMsg, maxMessageChars);
+            }
+            // Turn end implies any pending perm resolved one way or another.
+            opts.onPermissionResolved?.(sid);
+            scheduleEvict(sess);
+            break;
+          }
+          default: {
+            log?.debug("event_source_unknown_status_phase", { name, phase });
+          }
+        }
         break;
       }
+
       default: {
-        // Unknown event but has a sessionId: keep tracking + log.
         log?.debug("event_source_unknown_event", { name });
       }
     }
 
-    // v0.4.3 — notify broker that this session's data may have changed,
-    // so it can re-broadcast a WS state message with the latest title /
-    // lastMessage. Without this, SSE updates only surface to the floater
-    // when a hook event happens to fire onChange.
+    // Re-broadcast on every event so the floater always picks up the latest
+    // session-record snapshot.
     try {
       onSessionUpdate?.();
-    } catch (err) {
-      log?.warn("event_source_on_session_update_error", {
-        err: (err as Error).message,
-      });
+    } catch {
+      /* ignore */
     }
   }
 
-  function ensureSession(sid: string, now: number): ActiveSession {
-    let s = sessions.get(sid);
-    if (!s) {
-      s = { sessionId: sid, lastTouchedAt: now };
-      sessions.set(sid, s);
+  // -------------------------------------------------------------------------
+  // Payload helpers.
+  // -------------------------------------------------------------------------
+
+  function extractPayload(data: unknown): unknown {
+    if (!data || typeof data !== "object") return undefined;
+    return (data as { payload?: unknown }).payload;
+  }
+
+  function extractSessionId(data: unknown): string | undefined {
+    const payload = extractPayload(data);
+    if (payload && typeof payload === "object") {
+      const sid = (payload as { sessionId?: unknown }).sessionId;
+      if (typeof sid === "string" && sid) return sid;
     }
-    return s;
-  }
-
-  function scheduleEvict(s: ActiveSession): void {
-    cancelEvict(s);
-    // v0.4.3 — opt-out: 0 means "don't auto-evict, wait for user dismiss".
-    if (evictAfterMs <= 0) return;
-    s.evictTimer = opts.clock.setTimeout(() => {
-      sessions.delete(s.sessionId);
-    }, evictAfterMs);
-  }
-
-  function cancelEvict(s: ActiveSession): void {
-    if (s.evictTimer) {
-      opts.clock.clearTimeout(s.evictTimer);
-      s.evictTimer = null;
+    if (data && typeof data === "object") {
+      const sid = (data as { sessionId?: unknown }).sessionId;
+      if (typeof sid === "string" && sid) return sid;
     }
+    return undefined;
   }
 
-  /**
-   * v0.4.3 — start a 1.5s polling loop that re-fetches the latest assistant
-   * message for a `started` session. The mavis daemon does NOT push token
-   * stream over /api/events (that's only on the per-session POST response),
-   * so we have to pull. Polling stops automatically on session.finish or
-   * eviction. Idempotent — calling with a session that already has a poller
-   * is a no-op.
-   */
-  function startMessagePolling(s: ActiveSession): void {
-    if (s.pollTimer) return;
-    const tick = async () => {
-      // If session moved on (finished / evicted), stop.
-      if (s.status !== "started" || !sessions.has(s.sessionId)) {
-        s.pollTimer = null;
-        return;
-      }
+  function extractTitleFromPayload(data: unknown): string | undefined {
+    const payload = extractPayload(data);
+    if (payload && typeof payload === "object") {
+      const t = (payload as { title?: unknown }).title;
+      if (typeof t === "string" && t.trim()) return t;
+    }
+    return undefined;
+  }
+
+  // -------------------------------------------------------------------------
+  // SSE consumer loop.
+  // -------------------------------------------------------------------------
+
+  async function consume(): Promise<void> {
+    while (!stopped) {
+      abortController = new AbortController();
+      const url = `${baseUrl}/mavis/api/events`;
+      log?.info("event_source_starting", { url });
       try {
-        // v0.4.4 — pass `lastTurnStartTimestamp` so a polling fetch that
-        // races against daemon producing the new turn's first chunk
-        // skips the previous turn's final reply (avoids stale "done"
-        // text resurrecting on the card).
-        const fetched = await fetchLatestMessage(
-          s.sessionId,
-          s.lastTurnStartTimestamp,
-        );
-        if (fetched && fetched !== s.lastMessage) {
-          s.lastMessage = fetched;
-          s.lastTouchedAt = opts.clock.now();
-          try {
-            onSessionUpdate?.();
-          } catch {
-            /* ignore */
-          }
-        }
-      } catch {
-        /* ignore poll error — next tick will retry */
-      }
-      // Recurse via setTimeout (Clock interface has no setInterval; this
-      // also makes each poll wait for the previous fetch to finish).
-      if (s.status === "started" && sessions.has(s.sessionId)) {
-        s.pollTimer = opts.clock.setTimeout(() => void tick(), 1500);
-      } else {
-        s.pollTimer = null;
-      }
-    };
-    // Kick off immediately too — don't wait 1.5s for the first one.
-    s.pollTimer = opts.clock.setTimeout(() => void tick(), 0);
-  }
-
-  function stopMessagePolling(s: ActiveSession): void {
-    if (s.pollTimer) {
-      opts.clock.clearTimeout(s.pollTimer);
-      s.pollTimer = null;
-    }
-  }
-
-  // -------------------------------------------------------------------------
-  // SSE stream loop — fetch + ReadableStream + line parser.
-  // -------------------------------------------------------------------------
-
-  async function runOnce(): Promise<void> {
-    abortCtrl = new AbortController();
-    let response: Response;
-    try {
-      response = await fetchImpl(eventsUrl, {
-        signal: abortCtrl.signal,
-        headers: { accept: "text/event-stream" },
-      });
-    } catch (err) {
-      if (stopped) return;
-      log?.debug("event_source_connect_failed", {
-        err: (err as Error).message,
-      });
-      throw err;
-    }
-    if (!response.ok) {
-      log?.warn("event_source_http_error", { status: response.status });
-      throw new Error(`SSE HTTP ${response.status}`);
-    }
-    if (!response.body) {
-      log?.warn("event_source_no_body");
-      throw new Error("SSE response had no body");
-    }
-
-    log?.info("event_source_connected", { url: eventsUrl });
-    backoffMs = initialBackoffMs; // reset on successful connect
-
-    const reader = (
-      response.body as ReadableStream<Uint8Array>
-    ).getReader();
-    const decoder = new TextDecoder("utf-8");
-    let buffer = "";
-
-    // Pending event accumulator — SSE event blocks are separated by blank lines.
-    let curEventName = "message"; // default per SSE spec
-    let curDataLines: string[] = [];
-
-    const flush = async (): Promise<void> => {
-      if (curDataLines.length === 0 && curEventName === "message") return;
-      const raw = curDataLines.join("\n");
-      let parsed: unknown = raw;
-      if (raw) {
-        try {
-          parsed = JSON.parse(raw);
-        } catch {
-          // Leave parsed as raw string — handlers extract defensively.
-        }
-      }
-      const eventName = curEventName;
-      // Track the handler in `inflight` so tests can await whenIdle().
-      // We do NOT await inside the stream loop — the loop is allowed to
-      // continue parsing the next event while the previous handler's
-      // fetch chain settles. This matches typical SSE consumer semantics.
-      const p = (async () => {
-        try {
-          await handleEvent(eventName, parsed);
-        } catch (err) {
-          log?.warn("event_source_handler_error", {
-            event: eventName,
-            err: (err as Error).message,
-          });
-        }
-      })();
-      inflight.add(p);
-      void p.finally(() => {
-        inflight.delete(p);
-      });
-      curEventName = "message";
-      curDataLines = [];
-    };
-
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-
-      // Split on \n; keep last partial line in buffer.
-      let nlIdx: number;
-      while ((nlIdx = buffer.indexOf("\n")) !== -1) {
-        let line = buffer.slice(0, nlIdx);
-        buffer = buffer.slice(nlIdx + 1);
-        // Strip trailing \r (CRLF tolerance).
-        if (line.endsWith("\r")) line = line.slice(0, -1);
-
-        if (line === "") {
-          // Blank line → dispatch event block.
-          await flush();
+        const response = await fetchImpl(url, {
+          headers: { accept: "text/event-stream" },
+          signal: abortController.signal,
+        });
+        if (!response.ok || !response.body) {
+          log?.warn("event_source_http_error", { status: response.status });
+          await backoffDelay();
           continue;
         }
-        // Comment line per SSE spec.
-        if (line.startsWith(":")) continue;
-
-        const colonIdx = line.indexOf(":");
-        let field: string;
-        let val: string;
-        if (colonIdx === -1) {
-          field = line;
-          val = "";
-        } else {
-          field = line.slice(0, colonIdx);
-          val = line.slice(colonIdx + 1);
-          // SSE spec: optional single space after colon.
-          if (val.startsWith(" ")) val = val.slice(1);
+        log?.info("event_source_connected", { url });
+        backoff = initialBackoffMs;
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = "";
+        let currentEvent = "message";
+        let currentData = "";
+        while (!stopped) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          let nlIdx;
+          while ((nlIdx = buf.indexOf("\n")) >= 0) {
+            let line = buf.slice(0, nlIdx);
+            buf = buf.slice(nlIdx + 1);
+            if (line.endsWith("\r")) line = line.slice(0, -1);
+            if (line === "") {
+              // Dispatch event.
+              if (currentData) {
+                let parsed: unknown = currentData;
+                try {
+                  parsed = JSON.parse(currentData);
+                } catch {
+                  /* keep raw */
+                }
+                bumpHandler();
+                handleEvent(currentEvent, parsed)
+                  .catch((err) => log?.warn("event_source_handler_error", { name: currentEvent, err: (err as Error).message }))
+                  .finally(() => settleHandler());
+              }
+              currentEvent = "message";
+              currentData = "";
+              continue;
+            }
+            if (line.startsWith(":")) continue; // comment
+            if (line.startsWith("event:")) {
+              currentEvent = line.slice(6).trim();
+              continue;
+            }
+            if (line.startsWith("data:")) {
+              currentData += line.slice(5).trimStart();
+              continue;
+            }
+            // unknown field — ignore
+          }
         }
-        if (field === "event") {
-          curEventName = val || "message";
-        } else if (field === "data") {
-          curDataLines.push(val);
-        } else if (field === "id" || field === "retry") {
-          // Ignored — we manage reconnect on our own.
-        } else {
-          // Unknown SSE field — ignore per spec.
+      } catch (err) {
+        if (!stopped) {
+          log?.warn("event_source_loop_error", { err: (err as Error).message });
         }
       }
+      if (!stopped) await backoffDelay();
     }
-
-    // Stream ended — flush any pending block then return so caller schedules reconnect.
-    await flush();
   }
 
-  function scheduleReconnect(): void {
-    if (stopped) return;
-    log?.debug("event_source_reconnect_scheduled", { ms: backoffMs });
-    reconnectTimer = opts.clock.setTimeout(() => {
-      reconnectTimer = null;
-      backoffMs = Math.min(backoffMs * 2, maxBackoffMs);
-      void loop();
-    }, backoffMs);
-  }
-
-  async function loop(): Promise<void> {
-    if (stopped) return;
-    try {
-      await runOnce();
-    } catch (err) {
-      if (stopped) return;
-      log?.debug("event_source_stream_error", {
-        err: (err as Error).message,
-      });
-    } finally {
-      abortCtrl = null;
-    }
-    scheduleReconnect();
+  async function backoffDelay(): Promise<void> {
+    await new Promise<void>((resolve) => {
+      opts.clock.setTimeout(() => resolve(), backoff);
+    });
+    backoff = Math.min(backoff * 2, maxBackoffMs);
   }
 
   return {
-    start() {
+    start(): void {
+      if (stopped) return;
       if (started) return;
       started = true;
-      stopped = false;
-      log?.info("event_source_starting", { url: eventsUrl });
-      void loop();
+      void consume();
     },
-    stop() {
-      if (stopped) return;
+    stop(): void {
       stopped = true;
-      if (reconnectTimer) {
-        opts.clock.clearTimeout(reconnectTimer);
-        reconnectTimer = null;
-      }
-      if (abortCtrl) {
+      if (abortController) {
         try {
-          abortCtrl.abort();
+          abortController.abort();
         } catch {
           /* ignore */
         }
-        abortCtrl = null;
       }
-      // Cancel all pending evict timers.
-      for (const s of sessions.values()) cancelEvict(s);
       log?.info("event_source_stopped");
     },
-    getActiveSessions() {
+    getActiveSessions(): Map<string, ActiveSession> {
       return new Map(sessions);
     },
-    activeCount() {
+    activeCount(): number {
       return sessions.size;
     },
-    markAction(sid, action) {
-      // v0.4.3 — broker calls this on PreToolUse hook events to update the
-      // live status (e.g. "执行命令" for bash, "搜索代码" for grep). May be
-      // called for sessions not yet in pool (e.g. before session.start
-      // arrives) — in that case create a stub entry so we don't lose the
-      // action when SSE catches up.
-      const now = opts.clock.now();
-      let s = sessions.get(sid);
-      if (!s) {
-        s = ensureSession(sid, now);
-      }
-      if (action === null || action === "") {
-        s.currentAction = undefined;
+    dismissCurrent(sessionId: string | null): void {
+      if (sessionId) {
+        sessions.delete(sessionId);
       } else {
-        s.currentAction = action;
-      }
-      s.lastTouchedAt = now;
-      try {
-        onSessionUpdate?.();
-      } catch {
-        /* ignore */
-      }
-    },
-    dismissCurrent() {
-      // Pick the most-recently-touched non-hidden session and evict it.
-      // Used by floater hover-on-done card to clear the displayed entry.
-      let best: ActiveSession | null = null;
-      for (const s of sessions.values()) {
-        if (s.hidden) continue;
-        if (!best || s.lastTouchedAt > best.lastTouchedAt) best = s;
-      }
-      if (best) {
-        cancelEvict(best);
-        stopMessagePolling(best);
-        sessions.delete(best.sessionId);
-        try {
-          onSessionUpdate?.();
-        } catch {
-          /* ignore */
+        // Drop the most-recently-touched non-hidden session.
+        let best: ActiveSession | undefined;
+        for (const s of sessions.values()) {
+          if (s.hidden) continue;
+          if (!best || s.lastTouchedAt > best.lastTouchedAt) best = s;
         }
+        if (best) sessions.delete(best.sessionId);
       }
+      onSessionUpdate?.();
     },
-    async whenIdle() {
-      // Drain in waves — each handler may schedule another inner await chain
-      // (fetch + json), so we re-snapshot until the set stays empty across
-      // a microtask tick.
-      while (inflight.size > 0) {
-        await Promise.allSettled(Array.from(inflight));
-      }
+    whenIdle(): Promise<void> {
+      if (pendingHandlers === 0) return Promise.resolve();
+      return new Promise<void>((resolve) => {
+        idleResolvers.push(resolve);
+      });
     },
   };
-}
-
-// -----------------------------------------------------------------------------
-// Defensive field-extraction helpers.
-// -----------------------------------------------------------------------------
-
-function extractField(data: unknown, key: string): unknown {
-  if (!data || typeof data !== "object") return undefined;
-  return (data as Record<string, unknown>)[key];
-}
-
-/**
- * Extract sessionId from a daemon SSE event.
- *
- * Daemon uses a standardized envelope `{type, timestamp, source, payload}`
- * (see `EventBus.emit` in daemon.js). All session-related fields live under
- * `data.payload.*`. We try `data.payload.sessionId` FIRST (the real shape),
- * then fall back to flat `data.sessionId` etc. for forward-compat with any
- * future event types that might inline fields.
- */
-function extractSessionId(data: unknown): string | undefined {
-  // Daemon real shape: data.payload.sessionId
-  if (data && typeof data === "object") {
-    const payload = (data as { payload?: unknown }).payload;
-    if (payload && typeof payload === "object") {
-      for (const k of ["sessionId", "session_id", "sid"]) {
-        const v = (payload as Record<string, unknown>)[k];
-        if (typeof v === "string" && v) return v;
-      }
-    }
-  }
-  // Fallback: flat (defensive — never observed but keep for forward-compat).
-  for (const k of ["sessionId", "session_id", "sid"]) {
-    const v = extractField(data, k);
-    if (typeof v === "string" && v) return v;
-  }
-  return undefined;
-}
-
-/**
- * Extract a string title from a daemon SSE event payload.
- * Used by `session.title_updated` to set sess.title without an extra HTTP fetch.
- */
-function extractTitleFromPayload(data: unknown): string | undefined {
-  if (!data || typeof data !== "object") return undefined;
-  const payload = (data as { payload?: unknown }).payload;
-  if (payload && typeof payload === "object") {
-    const t = (payload as { title?: unknown }).title;
-    if (typeof t === "string" && t.trim()) return t.trim();
-  }
-  return undefined;
-}
-
-function truncate(s: string, max: number): string {
-  // Single-line — strip newlines so the floater card stays one line.
-  const flat = s.replace(/\s+/g, " ").trim();
-  if (flat.length <= max) return flat;
-  return flat.slice(0, max - 1) + "…";
 }

@@ -13,7 +13,6 @@ import { createHttpHandler, startHttpServer } from "./http.js";
 import { type Logger, createLogger } from "./logger.js";
 import { StateMachine } from "./state-machine.js";
 import { WsHub } from "./ws.js";
-import { type PermPoller, startPermPoller } from "./perm-poller.js";
 import {
   createEventSource,
   type ActiveSession,
@@ -76,17 +75,18 @@ export interface BrokerOptions {
   /** Default time-to-live (ms) for bubbles. Defaults to 2500. */
   bubbleTtlMs?: number;
   /**
-   * Disable the mavis daemon permission poller.
-   *
-   * v0.4.2 — re-enabled by default. The endpoint moved to
-   * `/mavis/api/permission/requests` (see perm-poller.ts) so the 404 spam
-   * that justified disabling in v0.3.1 is gone. Set `disablePermPoller:
-   * true` for unit tests that should not touch a real daemon.
+  /**
+   * v0.6 — perm-poller fully removed. The 5s polling that detected
+   * PermissionResolved via vanish-diff is replaced by signals derived from
+   * `session.status_update` (phase=calling_tool / phase=done). The
+   * `disablePermPoller` and `permPollIntervalMs` options are retained as
+   * no-op stubs ONLY for backward-compat with callers that still set them;
+   * remove next major.
    */
   disablePermPoller?: boolean;
-  /** Override daemon URL for the perm poller. Default http://127.0.0.1:15321. */
+  /** Override daemon URL (used by the SSE consumer). Default http://127.0.0.1:15321. */
   daemonUrl?: string;
-  /** Perm poll interval in ms. Default 1500. */
+  /** v0.6 — no-op (perm-poller removed). Kept for backward-compat only. */
   permPollIntervalMs?: number;
   /**
    * Disable the mavis daemon SSE event-source consumer.
@@ -107,8 +107,6 @@ export interface BrokerHandle {
   hub: WsHub;
   http: HttpServer;
   wss: WebSocketServer;
-  /** Perm poller handle (null if disabled). */
-  permPoller: PermPoller | null;
   /** SSE event-source handle (null if disabled). */
   eventSource: EventSourceHandle | null;
   /** Graceful shutdown. */
@@ -219,14 +217,18 @@ export async function startBroker(opts: BrokerOptions = {}): Promise<BrokerHandl
         const ts = clock.now();
         broadcastForState(state, ts);
       },
-      // v0.4.4 — primary perm-pending signal. Daemon emits `permission.ask`
-      // on EventBus the moment a tool call hits a permission gate; we
-      // forward it to the state machine immediately (~100ms latency,
-      // was 1.5s via perm-poller). The poller is retained as a
-      // `PermissionResolved` detector only (daemon doesn't emit a
-      // corresponding `permission.resolved` event).
-      onPermissionAsk: (sid) => {
+      // v0.6 — primary perm-pending signal: daemon's session.status_update
+      // event with phase=waiting_perm. Forwarded to the state machine so
+      // the floater enters review state.
+      onPermissionRequested: (sid) => {
         machine.ingest({ kind: "PermissionRequested", sessionId: sid });
+      },
+      // v0.6 — perm-resolved signal: derived from session.status_update
+      // phase=calling_tool (tool started → perm allowed) or phase=done
+      // (turn ended → any pending perm resolved one way or the other).
+      // Replaces the v0.4.4 5s perm-poller vanish-detection loop.
+      onPermissionResolved: (sid) => {
+        machine.ingest({ kind: "PermissionResolved", sessionId: sid });
       },
     });
   }
@@ -327,23 +329,16 @@ export async function startBroker(opts: BrokerOptions = {}): Promise<BrokerHandl
     petRef,
     startedAt,
     logger,
-    // v0.4.3 — translate PreToolUse(tool) into a short Chinese verb describing
-    // what the session is doing right now. Falls back to "正在思考" via
-    // session.start; clears on session.finish.
-    onHookEvent: (event) => {
-      if (!eventSource) return;
-      if (event.kind === "PreToolUse" && event.tool) {
-        const action = toolActionLabel(event.tool);
-        eventSource.markAction(event.sessionId, action);
-      } else if (event.kind === "MessageComplete") {
-        eventSource.markAction(event.sessionId, null);
-      }
-    },
+    // v0.6 — onHookEvent observer callback removed. state-machine.ingest()
+    // is already invoked inside http.ts on every hook POST, so the only
+    // reason server.ts subscribed was to derive a Chinese tool-name verb
+    // for the floater card subtitle. v0.6 sources that directly from the
+    // daemon's session.status_update event (phase=calling_tool carries
+    // `tool` field; event-source.ts maps it via toolNameZh()).
     // v0.4.3 — floater POST /dismiss when user hovers/clicks a done card.
-    // Evict the session immediately so the card disappears (vs the default
-    // 5min lazy evict). Also stops any polling timer for that session.
+    // Evict the session immediately so the card disappears.
     onDismissCard: () => {
-      if (eventSource) eventSource.dismissCurrent();
+      if (eventSource) eventSource.dismissCurrent(null);
     },
   });
 
@@ -364,20 +359,10 @@ export async function startBroker(opts: BrokerOptions = {}): Promise<BrokerHandl
     }
   });
 
-  // Start the mavis daemon perm poller. v0.4.2: re-enabled by default. The
-  // endpoint moved to `/mavis/api/permission/requests` (was `/api/...` and
-  // 404'd, hence the v0.3.1 disable). Pass `disablePermPoller: true` for
-  // unit tests that should not touch a real daemon.
-  let permPoller: PermPoller | null = null;
-  if (!opts.disablePermPoller) {
-    permPoller = startPermPoller({
-      clock,
-      machine,
-      daemonUrl: opts.daemonUrl,
-      intervalMs: opts.permPollIntervalMs,
-      logger,
-    });
-  }
+  // v0.6 — perm-poller has been removed entirely. The new
+  // `session.status_update` SSE event covers both perm-pending
+  // (phase=waiting_perm) and perm-resolved (phase=calling_tool / done)
+  // signals natively, with <200ms latency vs the old 1.5s polling round trip.
 
   // Kick off the SSE consumer now that the broker is otherwise ready.
   if (eventSource) {
@@ -388,7 +373,6 @@ export async function startBroker(opts: BrokerOptions = {}): Promise<BrokerHandl
     host,
     port: address.port,
     pet: petRef.slug,
-    permPoller: permPoller !== null,
     eventSource: eventSource !== null,
   });
 
@@ -400,11 +384,9 @@ export async function startBroker(opts: BrokerOptions = {}): Promise<BrokerHandl
     hub,
     http,
     wss,
-    permPoller,
     eventSource,
     async close() {
       logger.info("broker_stopping");
-      if (permPoller) permPoller.stop();
       if (eventSource) eventSource.stop();
       hub.closeAll();
       await new Promise<void>((resolve) => {
@@ -435,26 +417,4 @@ function pickActiveSession(es: EventSourceHandle | null): ActiveSession | null {
     if (!best || s.lastTouchedAt > best.lastTouchedAt) best = s;
   }
   return best;
-}
-
-/**
- * v0.4.3 — map a tool name to a short Chinese verb describing what the
- * session is currently doing. Used by the broker's hook-event listener
- * (PreToolUse) to populate the floater card subtitle during a streaming
- * turn (replaces the empty "no message yet" gap with live status).
- *
- * Unknown tool → generic "调用工具中". Returning a stable Chinese label
- * keeps the floater card from flicker-changing on every tool swap.
- */
-function toolActionLabel(tool: string): string {
-  const t = tool.toLowerCase();
-  if (t === "bash") return "执行命令";
-  if (t === "webfetch" || t === "fetch") return "查阅资料";
-  if (t === "read") return "读取文件";
-  if (t === "write") return "编辑文件";
-  if (t === "edit") return "修改代码";
-  if (t === "grep" || t === "glob") return "搜索代码";
-  if (t === "task" || t === "spawn") return "派发任务";
-  if (t.startsWith("mavis_") || t.startsWith("mcp_")) return "调用工具";
-  return "调用工具";
 }

@@ -318,7 +318,7 @@ describe("event-source — daemon-real-shape sanity", () => {
     expect(es.activeCount()).toBe(0);
   });
 
-  it("v0.4.4 — permission.ask fires onPermissionAsk with sessionId+requestId", async () => {
+  it("v0.6 — session.status_update phase=waiting_perm fires onPermissionRequested with sessionId+requestId", async () => {
     const m = mockFetch({});
     const clock = new FakeClock();
     const calls: Array<{ sid: string; reqId: string | undefined }> = [];
@@ -327,7 +327,7 @@ describe("event-source — daemon-real-shape sanity", () => {
       daemonUrl: "http://localhost:9999",
       logger: NullLogger,
       fetchImpl: m.fetch,
-      onPermissionAsk: (sid, reqId) => {
+      onPermissionRequested: (sid, reqId) => {
         calls.push({ sid, reqId });
       },
     });
@@ -335,10 +335,10 @@ describe("event-source — daemon-real-shape sanity", () => {
     const stream = await m.waitForSseConnect();
 
     stream.push(
-      'event: permission.ask\n' +
-        'data: {"type":"permission.ask","timestamp":1,"source":"session-bridge",' +
-        '"payload":{"sessionId":"ses_perm","agentName":"main","requestId":"perm_abc",' +
-        '"toolName":"bash","toolInput":{"command":"ls"},"ruleContents":["ls:*"]}}\n\n',
+      'event: session.status_update\n' +
+        'data: {"type":"session.status_update","timestamp":1,"source":"session-bridge",' +
+        '"payload":{"sessionId":"ses_perm","agentName":"main","phase":"waiting_perm",' +
+        '"permKind":"bash","permRequestId":"perm_abc"}}\n\n',
     );
     await flushMicrotasks(20);
     await es.whenIdle();
@@ -346,9 +346,76 @@ describe("event-source — daemon-real-shape sanity", () => {
     expect(calls.length).toBe(1);
     expect(calls[0].sid).toBe("ses_perm");
     expect(calls[0].reqId).toBe("perm_abc");
+
+    const sess = es.getActiveSessions().get("ses_perm");
+    expect(sess?.currentAction).toBe("等待审批");
   });
 
-  it("v0.4.4 — session.start clears stale lastMessage from previous turn (bug fix)", async () => {
+  it("v0.6 — session.status_update phase=calling_tool fires onPermissionResolved + sets Chinese tool verb", async () => {
+    const m = mockFetch({});
+    const clock = new FakeClock();
+    const resolved: string[] = [];
+    es = createEventSource({
+      clock,
+      daemonUrl: "http://localhost:9999",
+      logger: NullLogger,
+      fetchImpl: m.fetch,
+      onPermissionResolved: (sid) => resolved.push(sid),
+    });
+    es.start();
+    const stream = await m.waitForSseConnect();
+
+    stream.push(
+      'event: session.status_update\n' +
+        'data: {"type":"session.status_update","timestamp":1,"source":"session-bridge",' +
+        '"payload":{"sessionId":"ses_tool","agentName":"main","phase":"calling_tool",' +
+        '"tool":"bash","toolPreview":"{\\"command\\":\\"ls\\"}"}}\n\n',
+    );
+    await flushMicrotasks(20);
+    await es.whenIdle();
+
+    expect(resolved).toEqual(["ses_tool"]);
+    const sess = es.getActiveSessions().get("ses_tool");
+    expect(sess?.status).toBe("started");
+    expect(sess?.currentAction).toBe("执行命令"); // bash → 执行命令
+  });
+
+  it("v0.6 — session.status_update phase=streaming_text sets lastMessage from textPreview, drops thinking stub", async () => {
+    const m = mockFetch({});
+    const clock = new FakeClock();
+    es = createEventSource({
+      clock,
+      daemonUrl: "http://localhost:9999",
+      logger: NullLogger,
+      fetchImpl: m.fetch,
+    });
+    es.start();
+    const stream = await m.waitForSseConnect();
+
+    // thinking first → currentAction = "正在思考"
+    stream.push(
+      'event: session.status_update\ndata: {"type":"session.status_update","timestamp":1,"source":"x",' +
+        '"payload":{"sessionId":"ses_stream","phase":"thinking"}}\n\n',
+    );
+    await flushMicrotasks(10);
+    await es.whenIdle();
+    expect(es.getActiveSessions().get("ses_stream")?.currentAction).toBe("正在思考");
+
+    // streaming_text → currentAction cleared, lastMessage = textPreview
+    stream.push(
+      'event: session.status_update\ndata: {"type":"session.status_update","timestamp":2,"source":"x",' +
+        '"payload":{"sessionId":"ses_stream","phase":"streaming_text",' +
+        '"textPreview":"hello world","textCharCount":11}}\n\n',
+    );
+    await flushMicrotasks(10);
+    await es.whenIdle();
+
+    const sess = es.getActiveSessions().get("ses_stream");
+    expect(sess?.currentAction).toBeUndefined();
+    expect(sess?.lastMessage).toBe("hello world");
+  });
+
+  it("v0.6 — session.status_update phase=thinking clears stale lastMessage from previous turn (bug 1 regression)", async () => {
     const m = mockFetch({
       "/mavis/api/session/ses_clear": {
         session: { sessionId: "ses_clear", displayName: "main" },
@@ -364,32 +431,60 @@ describe("event-source — daemon-real-shape sanity", () => {
     es.start();
     const stream = await m.waitForSseConnect();
 
-    // First turn: start → finish → session has lastMessage from final reply (simulated).
+    // Simulate first turn done → lastMessage holds final reply.
     stream.push(
-      'event: session.start\ndata: {"type":"session.start","timestamp":1,"source":"x","payload":{"sessionId":"ses_clear"}}\n\n' +
-        'event: session.finish\ndata: {"type":"session.finish","timestamp":2,"source":"x","payload":{"sessionId":"ses_clear"}}\n\n',
+      'event: session.status_update\ndata: {"type":"session.status_update","timestamp":1,"source":"x",' +
+        '"payload":{"sessionId":"ses_clear","phase":"done","finalMessage":"previous turn final reply"}}\n\n',
     );
-    await flushMicrotasks(20);
+    await flushMicrotasks(10);
     await es.whenIdle();
+    expect(es.getActiveSessions().get("ses_clear")?.lastMessage).toBe("previous turn final reply");
 
-    // Manually inject a stale lastMessage (simulates final reply from previous turn).
-    const sess = es.getActiveSessions().get("ses_clear");
-    expect(sess).toBeDefined();
-    sess!.lastMessage = "previous turn final reply";
-
-    // New turn arrives — session.start MUST clear lastMessage so the floater
-    // card stops showing previous reply while new turn is mid-flight.
+    // New turn → thinking MUST clear lastMessage so floater stops showing prior text.
     stream.push(
-      'event: session.start\ndata: {"type":"session.start","timestamp":3,"source":"x","payload":{"sessionId":"ses_clear"}}\n\n',
+      'event: session.status_update\ndata: {"type":"session.status_update","timestamp":2,"source":"x",' +
+        '"payload":{"sessionId":"ses_clear","phase":"thinking"}}\n\n',
     );
-    await flushMicrotasks(20);
+    await flushMicrotasks(10);
     await es.whenIdle();
 
     const after = es.getActiveSessions().get("ses_clear");
     expect(after).toBeDefined();
     expect(after!.lastMessage).toBeUndefined();
-    // currentAction should be reset to "正在思考".
     expect(after!.currentAction).toBe("正在思考");
+  });
+
+  it("v0.6 — session.status_update phase=done sets finalMessage + scheduleEvict + onPermissionResolved", async () => {
+    const m = mockFetch({});
+    const clock = new FakeClock();
+    const resolved: string[] = [];
+    es = createEventSource({
+      clock,
+      daemonUrl: "http://localhost:9999",
+      logger: NullLogger,
+      fetchImpl: m.fetch,
+      evictAfterMs: 60_000,
+      onPermissionResolved: (sid) => resolved.push(sid),
+    });
+    es.start();
+    const stream = await m.waitForSseConnect();
+
+    stream.push(
+      'event: session.status_update\ndata: {"type":"session.status_update","timestamp":1,"source":"x",' +
+        '"payload":{"sessionId":"ses_done","phase":"done","finalMessage":"all good","silent":false}}\n\n',
+    );
+    await flushMicrotasks(20);
+    await es.whenIdle();
+
+    const sess = es.getActiveSessions().get("ses_done");
+    expect(sess).toBeDefined();
+    expect(sess!.status).toBe("finished");
+    expect(sess!.lastMessage).toBe("all good");
+    expect(resolved).toEqual(["ses_done"]);
+
+    // Evict timer fires after evictAfterMs.
+    clock.advance(61_000);
+    expect(es.activeCount()).toBe(0);
   });
 });
 
