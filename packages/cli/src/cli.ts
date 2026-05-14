@@ -31,6 +31,7 @@ import {
   findPetdexPet,
   listPetdexPets,
 } from './petdex-adapter.js';
+import { runInstallWizard, runUninstall } from './install-wizard.js';
 
 const HOME = os.homedir();
 const PET_DIR = path.join(HOME, '.mavis/pets');
@@ -222,7 +223,34 @@ function copyBundledPet(srcDir: string, slug: string) {
 // ---- commands --------------------------------------------------------------
 
 async function cmdInstall(slug: string) {
-  if (!slug) throw new Error('usage: mavis-pet install <slug>');
+  // v0.7: bare `mavis-pet install` (no slug) launches the one-shot wizard
+  // for the "company mavis engineer" scenario. Backward compatible: passing
+  // a slug still does the original petdex pet install.
+  if (!slug) {
+    const results = await runInstallWizard();
+    const errs = results.filter((r) => r.status === 'error').length;
+    if (errs > 0) process.exit(1);
+    return;
+  }
+  if (slug === '-h' || slug === '--help') {
+    console.log(`mavis-pet install — install pet(s) and / or bootstrap mavis-pet
+
+  mavis-pet install              one-shot wizard (no args). Installs floater
+                                 binary, registers mavis hooks, picks a default
+                                 pet (boba via petdex; falls back to bundled
+                                 mikoko), writes user-level launchd plist
+                                 (~/Library/LaunchAgents/dev.mavis.pet.plist),
+                                 and starts the broker. Re-running is safe;
+                                 it bootouts the existing service first.
+
+  mavis-pet install <slug>       install a single pet by slug. Sources tried
+                                 in order: bundled (packages/cli/assets/pets/
+                                 — currently mikoko), local petdex CLI
+                                 (~/.petdex/pets/<slug>), petdex manifest
+                                 (env MAVIS_PET_MANIFEST).
+`);
+    return;
+  }
 
   // v0.4.2: try bundled assets first (packages/cli/assets/pets/<slug>/).
   // mikoko ships in-tree so `mavis-pet install mikoko` always works, even
@@ -422,6 +450,17 @@ async function cmdStatus() {
   console.log(`hooks      : ${hooks?.ids?.length ? kleur.green(`${hooks.ids.length} installed`) : kleur.dim('none installed')}`);
 }
 
+async function cmdUninstall() {
+  // Reverse of `mavis-pet install` (the wizard form). Removes:
+  //   - launchd plist + bootout
+  //   - ~/.mavis/pet/floater + pid files
+  //   - mavis hooks
+  // Deliberately preserves ~/.mavis/pets/ (user pet data is theirs to keep).
+  const results = await runUninstall();
+  const errs = results.filter((r) => r.status === 'error').length;
+  if (errs > 0) process.exit(1);
+}
+
 // ---- hook install/uninstall ----------------------------------------------
 
 interface HookSpec {
@@ -561,21 +600,29 @@ async function cmdHookUninstall() {
 function usage() {
   console.log(`mavis-pet — desktop companion that reacts to your mavis sessions
 
-  mavis-pet install <slug>      install a pet from the petdex gallery
-  mavis-pet list                list installed pets, mark active
-  mavis-pet switch <slug>       set active pet (broker hot-reload if running)
-  mavis-pet start               start broker + floater
-  mavis-pet stop                stop floater + broker
-  mavis-pet status              show pet/broker/floater/hook status
-  mavis-pet hook install        register the 6 mavis hooks (Pre/PostToolUse,
-                                MessageComplete, UserPromptSubmit,
-                                SessionStart, SessionEnd)
-  mavis-pet hook uninstall      remove those hooks
+  mavis-pet install              one-shot wizard: floater + hooks + default pet
+                                 + launchd autostart (5 min, fully non-interactive
+                                 after a single Enter to confirm)
+  mavis-pet install <slug>       install a specific pet from petdex / bundled
+                                 (e.g. 'mavis-pet install mikoko')
+  mavis-pet uninstall            reverse the wizard: bootout launchd, remove
+                                 floater binary + plist + hooks. Pets in
+                                 ~/.mavis/pets/ are preserved.
+  mavis-pet list                 list installed pets, mark active
+  mavis-pet switch <slug>        set active pet (broker hot-reload if running)
+  mavis-pet start                start broker + floater
+  mavis-pet stop                 stop floater + broker
+  mavis-pet status               show pet/broker/floater/hook status
+  mavis-pet hook install         register the 6 mavis hooks (Pre/PostToolUse,
+                                 MessageComplete, UserPromptSubmit,
+                                 SessionStart, SessionEnd)
+  mavis-pet hook uninstall       remove those hooks
 
 Env:
-  MAVIS_PET_BROKER_PORT (default 7857)
-  MAVIS_PET_FLOATER     (override floater binary path)
-  MAVIS_PET_MANIFEST    (override petdex manifest URL)
+  MAVIS_PET_BROKER_PORT          (default 7857)
+  MAVIS_PET_FLOATER              (override floater binary path)
+  MAVIS_PET_MANIFEST             (override petdex manifest URL)
+  MAVIS_PET_NONINTERACTIVE=1     skip the wizard's welcome confirmation
 `);
 }
 
@@ -583,12 +630,13 @@ async function main() {
   const [cmd, sub, arg] = process.argv.slice(2);
   try {
     switch (cmd) {
-      case 'install': await cmdInstall(sub); break;
-      case 'list':    await cmdList(); break;
-      case 'switch':  await cmdSwitch(sub); break;
-      case 'start':   await cmdStart(); break;
-      case 'stop':    await cmdStop(); break;
-      case 'status':  await cmdStatus(); break;
+      case 'install':   await cmdInstall(sub); break;
+      case 'uninstall': await cmdUninstall(); break;
+      case 'list':      await cmdList(); break;
+      case 'switch':    await cmdSwitch(sub); break;
+      case 'start':     await cmdStart(); break;
+      case 'stop':      await cmdStop(); break;
+      case 'status':    await cmdStatus(); break;
       case 'hook':
         if (sub === 'install')   await cmdHookInstall();
         else if (sub === 'uninstall') await cmdHookUninstall();
