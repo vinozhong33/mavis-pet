@@ -44,6 +44,14 @@ export interface ActiveSession {
   status?: string;
   /** ms ts of the last event that touched this session. */
   lastTouchedAt: number;
+  /**
+   * v0.7.3 — ms ts when this session was first added to sessionsBySid.
+   * Used as a STABLE sort key for the floater card stack: oldest cards
+   * stay on top, new sessions drop to the bottom. Replaces the previous
+   * sort-by-lastTouchedAt strategy which made cards visibly jump up/down
+   * on every streaming_text tick (vino reported this as "弹窗位置一直跳变").
+   */
+  firstSeenAt: number;
   /** v0.6.1 — ms ts when status flipped to 'finished' (drives 30s evict). */
   finishedAt?: number;
   /** When non-null, an evict timer scheduled for this session. */
@@ -53,6 +61,13 @@ export interface ActiveSession {
    * The floater hides these from the task card.
    */
   hidden?: boolean;
+  /**
+   * v0.7.3 — true when reseed pulled this session from daemon but the
+   * `title` field was still null/empty server-side (auto-title generation
+   * is async on daemon side, often races with reseed). Triggers a one-shot
+   * lazy refetch on the next event for this session.
+   */
+  needsTitleRefetch?: boolean;
   /**
    * Short Chinese verb describing what the session is currently doing.
    * Sourced from `session.status_update` phase:
@@ -283,9 +298,21 @@ export function createEventSource(opts: EventSourceOptions): EventSourceHandle {
             const sess: ActiveSession = {
               sessionId: s.sessionId,
               lastTouchedAt: typeof s.updatedAt === "number" ? s.updatedAt : now,
+              // v0.7.3 — anchor sort order to reseed time. Reseeded sessions
+              // appear in whatever order daemon returns them, but they all
+              // get firstSeenAt=now so any new session that streams in later
+              // sits below them in the floater stack.
+              firstSeenAt: typeof s.updatedAt === "number" ? s.updatedAt : now,
               status: "started",
               title: s.title,
               displayName: s.displayName ?? s.agentName ?? agent.displayName,
+              // v0.7.3 — daemon's auto-title generation is async; if title
+              // is empty at reseed time, mark for one-shot lazy refetch on
+              // the next inbound event for this session. Without this,
+              // worker sessions show as "Session mvs_xxx" forever because
+              // session.title_updated is only emitted at first generation
+              // and we already missed it.
+              needsTitleRefetch: !s.title,
             };
             sessions.set(s.sessionId, sess);
             added++;
@@ -350,7 +377,11 @@ export function createEventSource(opts: EventSourceOptions): EventSourceHandle {
   function ensureSession(sid: string, now: number): ActiveSession {
     let s = sessions.get(sid);
     if (!s) {
-      s = { sessionId: sid, lastTouchedAt: now };
+      // v0.7.3 — firstSeenAt is set ONCE on creation and never changes.
+      // The floater sorts cards by firstSeenAt ascending so existing cards
+      // stay put when a new session arrives (it just gets appended at the
+      // bottom of the stack instead of jumping to the top).
+      s = { sessionId: sid, lastTouchedAt: now, firstSeenAt: now };
       sessions.set(sid, s);
     }
     return s;
@@ -428,6 +459,23 @@ export function createEventSource(opts: EventSourceOptions): EventSourceHandle {
     const now = opts.clock.now();
     const sess = ensureSession(sid, now);
     sess.lastTouchedAt = now;
+
+    // v0.7.3 — one-shot lazy title refetch. Reseed-seeded sessions whose
+    // daemon-side title was empty at reseed time stay marked
+    // needsTitleRefetch=true. The first event that arrives for such a
+    // session triggers a single fetchSessionTitle() call (fire-and-forget
+    // — the title will populate on the *next* render cycle, no need to
+    // block this event handler).
+    if (sess.needsTitleRefetch) {
+      sess.needsTitleRefetch = false; // clear flag immediately to avoid re-fire
+      fetchSessionTitle(sid)
+        .then((info) => {
+          if (info?.title && !sess.title) sess.title = info.title;
+          if (info?.displayName && !sess.displayName) sess.displayName = info.displayName;
+          if (info?.title) onSessionUpdate?.();
+        })
+        .catch(() => { /* swallow — title is best-effort */ });
+    }
 
     switch (name) {
       case "session.created": {
@@ -719,9 +767,12 @@ export function createEventSource(opts: EventSourceOptions): EventSourceHandle {
       return new Map(sessions);
     },
     getSessionCards(): SessionCard[] {
-      // Convert internal ActiveSession map to public SessionCard[],
-      // skip cron-flagged hidden sessions, sort by lastEventTs descending
-      // (most recent activity on top of the floater's vertical stack).
+      // v0.7.3 — sort by firstSeenAt ASCENDING (oldest cards on top, new
+      // sessions append at the bottom). Replaces v0.6.1's sort by
+      // lastEventTs which made cards visibly jump up/down on every
+      // streaming_text tick. The stack is now position-stable: a card
+      // only moves when something LEAVES (evicted after 30s) — never when
+      // an existing card just gets a new event.
       const out: SessionCard[] = [];
       for (const s of sessions.values()) {
         if (s.hidden) continue;
@@ -743,7 +794,16 @@ export function createEventSource(opts: EventSourceOptions): EventSourceHandle {
         }
         out.push(card);
       }
-      out.sort((a, b) => b.lastEventTs - a.lastEventTs);
+      out.sort((a, b) => {
+        // v0.7.3 — sort by firstSeenAt ascending. Use the in-map sess
+        // ref since SessionCard doesn't carry firstSeenAt to clients
+        // (clients shouldn't depend on it).
+        const sa = sessions.get(a.sessionId);
+        const sb = sessions.get(b.sessionId);
+        const fa = sa?.firstSeenAt ?? a.lastEventTs;
+        const fb = sb?.firstSeenAt ?? b.lastEventTs;
+        return fa - fb;
+      });
       return out;
     },
     activeCount(): number {

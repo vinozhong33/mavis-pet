@@ -472,9 +472,12 @@
       // ordered cards into a stable key, compare to previous, no-op on match.
       let lastRenderKey = '';
       function renderCards() {
-        // Sort sessions by lastEventTs descending (most recent on top).
-        const ordered = Array.from(sessionsBySid.values())
-          .sort((a, b) => (b.lastEventTs || 0) - (a.lastEventTs || 0));
+        // v0.7.3 — DO NOT sort here. Broker sends sessions already ordered
+        // by firstSeenAt ascending (oldest on top, newest at bottom).
+        // Re-sorting on the client by lastEventTs caused position-instability
+        // (vino: "弹窗位置一直跳变") because every streaming_text event
+        // bumped lastEventTs and made cards swap places.
+        const ordered = Array.from(sessionsBySid.values());
 
         // Build a stable key of the visible state. Include only fields that
         // actually drive the DOM: id, status, currentAction, lastMessage,
