@@ -255,6 +255,31 @@ export function createEventSource(opts: EventSourceOptions): EventSourceHandle {
             if (s?.status?.type !== "started") continue;
             if (!s.sessionId || sessions.has(s.sessionId)) continue;
 
+            // v0.6.1.3 — Filter cron-spawned sessions. The list endpoint
+            // doesn't return `purpose`, so fetch the detail and check the
+            // same `cron:` prefix the SSE session.created path uses.
+            // Without this, every cron tick (sync-health-events,
+            // daily-fitness-reminder, etc.) leaks into the floater stack
+            // even though those sessions are explicitly hidden in the
+            // SSE-driven path.
+            try {
+              const detRes = await fetchImpl(
+                `${baseUrl}/mavis/api/session/${s.sessionId}`,
+              );
+              if (detRes.ok) {
+                const det = (await detRes.json()) as {
+                  session?: { purpose?: string };
+                };
+                const purpose = det?.session?.purpose;
+                if (typeof purpose === "string" && purpose.startsWith("cron:")) {
+                  continue; // skip cron-spawned session entirely
+                }
+              }
+            } catch {
+              /* fall through and seed; better one stray cron card than
+               * nothing on a transient network blip */
+            }
+
             const sess: ActiveSession = {
               sessionId: s.sessionId,
               lastTouchedAt: typeof s.updatedAt === "number" ? s.updatedAt : now,
@@ -350,10 +375,14 @@ export function createEventSource(opts: EventSourceOptions): EventSourceHandle {
   }
 
   function truncate(s: string, max: number): string {
+    // v0.6.1.2 — kept for backward compat / future use; live path now uses
+    // tailOf() below to surface the closing paragraph instead of opening.
     const flat = s.replace(/\s+/g, " ").trim();
     if (flat.length <= max) return flat;
     return flat.slice(0, max - 1) + "…";
   }
+  // Suppress unused-warning when only tailOf is in the hot path.
+  void truncate;
 
   /**
    * v0.6.1.2 — Pick the "tail" of a long message for the floater card.
