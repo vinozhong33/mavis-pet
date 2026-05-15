@@ -1,6 +1,6 @@
 {
   "name": "@mavis-pet/broker",
-  "version": "0.1.0",
+  "version": "0.7.4",
   "description": "Mavis Pet broker — receives mavis hook events over HTTP, maintains per-session state machine, pushes aggregated pet animation state to floater clients via WebSocket.",
   "type": "module",
   "main": "dist/index.js",
