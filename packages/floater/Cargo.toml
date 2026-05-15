@@ -24,6 +24,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
 dirs = "5"
+# v0.7.6 — global cursor position polling (top-left coords, physical px),
+# used for the click-through hit-region polling task. Cross-platform but
+# we only enable the macOS path; lightweight (no proc-macro).
+mouse_position = "0.1"
 
 # macOS native APIs to lift the floater above other apps' fullscreen Spaces.
 # v0.4.1 — switched primary mechanism from raw cocoa NSWindow tweaks to
