@@ -1,6 +1,6 @@
 {
   "name": "mavis-pet",
-  "version": "0.7.4",
+  "version": "0.7.5",
   "description": "Mavis Pet — desktop companion that reacts to your mavis sessions. Install/control/run from the terminal.",
   "type": "module",
   "bin": {
