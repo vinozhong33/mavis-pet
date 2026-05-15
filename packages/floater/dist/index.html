@@ -14,12 +14,21 @@
         cursor: grab;
         user-select: none;
         font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", "PingFang SC", sans-serif;
+        /* v0.7.5+ click-through fix: the 380x400 window is mostly transparent.
+         * Without pointer-events:none, the empty pixels still hit-test the
+         * floater window and steal clicks from anything below it (Dock,
+         * Trash, Finder icons in the bottom-right corner, etc.). Children
+         * that should remain interactive (.pet-host, .cards-stack, .card,
+         * .pet-toggle) re-enable themselves via `pointer-events: auto`. */
+        pointer-events: none;
       }
       body:active { cursor: grabbing; }
       .stage {
         position: relative;
         width: 100%; height: 100%;
         background: transparent;
+        /* Inherit click-through from body — same reasoning as above. */
+        pointer-events: none;
         /* IMPORTANT: must be `visible`, not `hidden`. The chevron toggle
          * sits at top:-6 right:-10 relative to .pet-host (overlapping the
          * top-right corner of the pet sprite), which means part of it
@@ -59,7 +68,13 @@
         width: 320px;
         max-height: 100%;
         overflow: visible;
-        pointer-events: auto;
+        /* v0.7.5+ — was `pointer-events: auto`. Setting auto here means
+         * the 6px gap BETWEEN cards (and any flex slack inside the 320px
+         * column) hit-tests as the floater window, stealing clicks from
+         * apps below. Set none here; individual `.card` children re-enable
+         * themselves via `pointer-events: auto` so the cards themselves
+         * remain clickable. */
+        pointer-events: none;
       }
 
       /* Each individual session card. Renders agentName/title (bold one
@@ -371,6 +386,7 @@
             petEl.style.setProperty(`--row-${s}-y`, `-${row * scaledFrameH}px`);
           });
           console.log(`[mavis-pet] loaded ${p.slug}`);
+          scheduleReportRects();
         } catch (e) {
           console.error('[mavis-pet] loadPet failed:', e);
         }
@@ -589,6 +605,7 @@
           petHostEl.classList.remove('has-tasks', 'collapsed');
           document.body.classList.remove('cards-collapsed');
         }
+        scheduleReportRects();
       }
 
       // v0.6.1 — patch an existing card DOM element with fresh card data.
@@ -641,8 +658,66 @@
         collapsed = !collapsed;
         try { localStorage.setItem(COLLAPSED_KEY, collapsed ? '1' : '0'); } catch {}
         renderCards();
+        scheduleReportRects();
       });
       toggleEl.addEventListener('mousedown', (e) => e.stopPropagation());
+
+      // ---- v0.7.6 click-through hit-region reporting ---------------------
+      // The Rust side runs a 60fps cursor-position polling task and toggles
+      // NSWindow.ignoresMouseEvents based on whether the cursor is over an
+      // interactive rectangle. Web's job: keep Rust's rect set in sync with
+      // the actual layout (sprite + cards + toggle).
+      let _reportTimer = null;
+      function scheduleReportRects() {
+        if (_reportTimer) return;
+        _reportTimer = requestAnimationFrame(() => {
+          _reportTimer = null;
+          reportRects();
+        });
+      }
+      function reportRects() {
+        if (!invoke) return;
+        const rects = [];
+        // Pet host (sprite + chevron/badge). Always report; if width/height
+        // are 0 (sprite still loading) we skip — Rust will treat the empty
+        // set as "ignore everything", which is actually correct (no sprite
+        // = nothing to interact with yet).
+        if (petHostEl) {
+          const r = petHostEl.getBoundingClientRect();
+          if (r.width > 0 && r.height > 0) {
+            // v0.7.6.1 — inflate by 30px around the sprite. The Rust hit-region
+            // poller runs at ~60fps, so a fast cursor entry into the sprite
+            // can land a mousedown on the same frame that ignore is still
+            // true → the first click gets passed through to the app below
+            // and Tauri's drag region never sees the mousedown → drag is
+            // dead. Pre-inflating the rect makes Rust flip ignore=false
+            // BEFORE the cursor reaches the sprite, so mousedown lands on
+            // the WebView. Trade-off: a 30px transparent halo around
+            // Pikachu still hit-tests as the floater, but that's a small
+            // band vs the 380×400 default rectangle.
+            const SLACK = 30;
+            rects.push([r.left - SLACK, r.top - SLACK, r.width + SLACK * 2, r.height + SLACK * 2]);
+          }
+        }
+        // Cards stack: skip when collapsed (cards aren't visible).
+        if (cardsEl && !collapsed && sessionsBySid.size > 0) {
+          // Report each card individually (cards-stack itself has padding /
+          // gaps that should remain pass-through). Same pre-inflate logic
+          // applies for clicks landing on cards.
+          const CARD_SLACK = 12;
+          for (const cardEl of cardsEl.querySelectorAll('.card')) {
+            const r = cardEl.getBoundingClientRect();
+            if (r.width > 0 && r.height > 0) {
+              rects.push([r.left - CARD_SLACK, r.top - CARD_SLACK, r.width + CARD_SLACK * 2, r.height + CARD_SLACK * 2]);
+            }
+          }
+        }
+        try {
+          invoke('set_interactive_rects', { rects });
+        } catch (err) {
+          console.warn('[mavis-pet] reportRects failed:', err);
+        }
+      }
 
       // ---- WS client -----------------------------------------------------
       const WS_URL = 'ws://127.0.0.1:7857/ws';
@@ -687,6 +762,20 @@
         loadPet(null);
         renderCards();   // initial: nothing to show, but apply collapsed class state
         connect();
+        // v0.7.6 — keep the Rust-side hit-region rects in sync with layout.
+        try {
+          const ro = new ResizeObserver(() => scheduleReportRects());
+          if (petHostEl) ro.observe(petHostEl);
+          if (cardsEl) ro.observe(cardsEl);
+        } catch { /* manual scheduleReportRects calls in renderCards/loadPet still cover */ }
+        // First report after sprite has settled.
+        setTimeout(() => scheduleReportRects(), 200);
+        // Periodic safety net — drag (which moves the WINDOW, not the
+        // rects) doesn't touch web layout but the Rust poller derives its
+        // local coords from window.outer_position() each tick, so this is
+        // really only needed if layout changed without ResizeObserver
+        // catching it. Cheap insurance every 1s.
+        setInterval(() => scheduleReportRects(), 1000);
 
         document.body.addEventListener('mousedown', async (e) => {
           if (e.button !== 0) return;

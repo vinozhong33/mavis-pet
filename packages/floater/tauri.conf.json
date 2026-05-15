@@ -21,7 +21,7 @@
         "shadow": false,
         "skipTaskbar": false,
         "fullscreen": false,
-        "center": true,
+        "center": false,
         "acceptFirstMouse": true,
         "visible": true
       }

@@ -24,7 +24,77 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Manager};
+
+// ---- v0.7.6 click-through hit-region polling -----------------------------
+// macOS WKWebView does NOT pass clicks on transparent pixels through to
+// apps below — even when CSS pointer-events:none is set on the html/body.
+// Workaround: keep the window's NSWindow.ignoresMouseEvents in sync with
+// where the cursor actually is. Pass-through (=true) when the cursor is
+// over a transparent pixel, normal (=false) when it's over the sprite or
+// a card. Web reports its interactive rectangles via set_interactive_rects;
+// a background polling task does the spatial check at ~60 fps.
+//
+// Why polling instead of a JS-driven mouseenter/leave: when ignore=true,
+// the WebView does not receive mouse events at all (the OS routes them
+// to the window below), so JS can never observe "cursor came back". Only
+// a polling loop OUTSIDE the WebView can see it.
+
+#[derive(Clone, Default)]
+struct InteractiveRects(Arc<Mutex<Vec<(f64, f64, f64, f64)>>>);
+
+impl InteractiveRects {
+    fn replace(&self, rects: Vec<(f64, f64, f64, f64)>) {
+        if let Ok(mut g) = self.0.lock() {
+            *g = rects;
+        }
+    }
+    fn snapshot(&self) -> Vec<(f64, f64, f64, f64)> {
+        self.0.lock().map(|g| g.clone()).unwrap_or_default()
+    }
+}
+
+/// v0.7.6.7 — shared, live window-position state, written from
+/// (a) the startup positioning code and (b) WindowEvent::Moved on user
+/// drag. The hit-region poller reads from this instead of NSPanel's
+/// `[NSWindow frame]` (which goes stale under tauri-nspanel's swizzle
+/// and silently keeps reporting the construction-time position).
+///
+/// Stored in PHYSICAL pixels, top-left, global coords (same units as
+/// Tauri's PhysicalPosition / WindowEvent::Moved payload).
+#[derive(Clone, Default)]
+struct WindowFrameState(Arc<Mutex<Option<(f64, f64, f64, f64, f64)>>>);
+
+impl WindowFrameState {
+    fn set(&self, x: f64, y: f64, w: f64, h: f64, sf: f64) {
+        if let Ok(mut g) = self.0.lock() {
+            *g = Some((x, y, w, h, sf));
+        }
+    }
+    fn snapshot(&self) -> Option<(f64, f64, f64, f64, f64)> {
+        self.0.lock().ok().and_then(|g| *g)
+    }
+    fn move_to(&self, x: f64, y: f64) {
+        if let Ok(mut g) = self.0.lock() {
+            if let Some((_, _, w, h, sf)) = *g {
+                *g = Some((x, y, w, h, sf));
+            }
+        }
+    }
+}
+
+#[tauri::command]
+fn set_interactive_rects(
+    rects: Vec<[f64; 4]>,
+    state: tauri::State<'_, InteractiveRects>,
+) {
+    let parsed: Vec<(f64, f64, f64, f64)> = rects
+        .into_iter()
+        .map(|r| (r[0], r[1], r[2], r[3]))
+        .collect();
+    state.replace(parsed);
+}
 
 // ---- macOS: lift floater above fullscreen Spaces & menu bar ---------------
 //
@@ -427,11 +497,14 @@ pub fn run() {
         // `to_panel` looks up. If we register after setup, `to_panel` panics
         // with "PanelManager not found in app state".
         .plugin(tauri_nspanel::init())
+        .manage(InteractiveRects::default())
+        .manage(WindowFrameState::default())
         .invoke_handler(tauri::generate_handler![
             get_pet,
             list_pets,
             reload_pet,
-            open_session_url
+            open_session_url,
+            set_interactive_rects
         ])
         .setup(|app| {
             // Touch the path to surface "no home dir" failures early in stderr.
@@ -453,14 +526,326 @@ pub fn run() {
                 if let Err(e) = install_pet_panel(&window) {
                     eprintln!("[mavis-pet-floater] panel install failed: {e}");
                 }
-                // No watchdog — NSPanel's collectionBehavior + level survive
-                // fullscreen / Space transitions natively, unlike the v0.4.0
-                // raw-NSWindow approach.
+
+                // v0.7.6.6 — defer positioning by 500ms. Calling
+                // set_position inside the setup hook (right after
+                // install_pet_panel.show()) gets overridden by NSPanel's
+                // own show-time position handling — the actual visible
+                // panel ended up at its construction-time position. A
+                // brief delay lets the panel settle, then set_position
+                // sticks.
+                let window_for_pos = window.clone();
+                let frame_state: tauri::State<'_, WindowFrameState> = app.state();
+                let frame_state_clone = frame_state.inner().clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    position_bottom_right_v2(&window_for_pos, &frame_state_clone);
+                });
+
+                // v0.7.6.7 — keep WindowFrameState in sync with user drags.
+                // tauri-nspanel's NSWindow swizzle makes [NSWindow frame]
+                // stale, so the poller can't read live position from
+                // AppKit; instead it reads from WindowFrameState which we
+                // update here on every move event.
+                let frame_state_for_event = frame_state.inner().clone();
+                window.on_window_event(move |event| {
+                    if let tauri::WindowEvent::Moved(pos) = event {
+                        // pos is PhysicalPosition<i32>, top-left, global.
+                        frame_state_for_event.move_to(pos.x as f64, pos.y as f64);
+                    }
+                });
+
+                // v0.7.6 — start the click-through hit-region polling task.
+                // 8ms cadence (~120 fps) is responsive enough that the user
+                // doesn't notice the toggle when crossing the sprite border.
+                let rects: tauri::State<'_, InteractiveRects> = app.state();
+                let frame_state_for_poll = frame_state.inner().clone();
+                spawn_hit_region_poller(window.clone(), rects.inner().clone(), frame_state_for_poll);
             }
             Ok(())
         })
         .run(tauri::generate_context!())
         .expect("error while running mavis-pet-floater");
+}
+
+#[cfg(target_os = "macos")]
+fn position_bottom_right(window: &tauri::WebviewWindow, _margin_px: i32) {
+    use cocoa::appkit::NSScreen;
+    use cocoa::base::{id, nil};
+    use cocoa::foundation::NSRect;
+    unsafe {
+        let main_screen: id = NSScreen::mainScreen(nil);
+        if main_screen == nil { return; }
+        // visibleFrame excludes the menu bar (top) and the Dock area —
+        // safer than frame() for "right-bottom corner" placement.
+        let vis: NSRect = NSScreen::visibleFrame(main_screen);
+        // visibleFrame uses macOS BOTTOM-LEFT logical points. Tauri
+        // set_position uses TOP-LEFT logical points relative to the
+        // primary screen (origin top-left).
+        // Convert: vis.origin is bottom-left in macOS coords; the bottom
+        // of the visible area in TOP-LEFT coords is the screen height
+        // minus visiblY.
+        let full: NSRect = NSScreen::frame(main_screen);
+        let screen_top_height = full.size.height as f64;
+        let vis_x = vis.origin.x as f64;
+        let vis_y_bottomleft = vis.origin.y as f64;
+        let vis_w = vis.size.width as f64;
+        let vis_h = vis.size.height as f64;
+        // Top-Y of the visible area (in top-left coords).
+        let vis_top_y = screen_top_height - (vis_y_bottomleft + vis_h);
+
+        let win_w = 380.0;
+        let win_h = 400.0;
+        // The sprite sits at the bottom-RIGHT of the window. To put the
+        // VISIBLE Pikachu at the bottom-right of the screen, we need the
+        // window's bottom-right to be inside the visible area. Add a small
+        // margin so the chevron isn't clipped (chevron pokes 4px right).
+        let margin = 20.0;
+        let x = (vis_x + vis_w - win_w + margin).max(vis_x);  // +margin pushes window slightly off-screen-right so the sprite (which sits at window's right edge) lands ON the screen edge
+        let y = (vis_top_y + vis_h - win_h + margin).max(vis_top_y);
+        // Debug log so we can see what we calculated.
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true).append(true)
+            .open(dirs::home_dir().unwrap_or_default().join(".mavis/pet/logs/floater-hitregion.log")) {
+            use std::io::Write;
+            let _ = writeln!(
+                f,
+                "[STARTUP] mainScreen full=({:.0},{:.0},{:.0},{:.0}) vis=({:.0},{:.0},{:.0},{:.0}) vis_top_y={:.0} -> set_position logical=({:.0},{:.0})",
+                full.origin.x as f64, full.origin.y as f64, full.size.width as f64, full.size.height as f64,
+                vis_x, vis_y_bottomleft, vis_w, vis_h,
+                vis_top_y, x, y
+            );
+        }
+        let _ = window.set_position(tauri::Position::Logical(
+            tauri::LogicalPosition { x, y },
+        ));
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn position_bottom_right(_window: &tauri::WebviewWindow, _margin_px: i32) {}
+
+/// v0.7.6.5 — Tauri-API-only positioning. Uses Window::current_monitor()
+/// which returns physical-pixel monitor info in the SAME coordinate space
+/// that Tauri's set_position(PhysicalPosition) expects. Avoids the cocoa
+/// logical-vs-Tauri-global-logical mismatch that pushed Pikachu off-screen
+/// on multi-monitor setups.
+fn position_bottom_right_v2(window: &tauri::WebviewWindow, frame_state: &WindowFrameState) {
+    // Try current_monitor (where the window sits) first; fall back to
+    // primary_monitor (whichever screen Tauri considers primary) if the
+    // window hasn't settled on a monitor yet.
+    let monitor = window
+        .current_monitor()
+        .ok()
+        .flatten()
+        .or_else(|| window.primary_monitor().ok().flatten());
+    let monitor = match monitor {
+        Some(m) => m,
+        None => return,
+    };
+    let mp = monitor.position();   // PhysicalPosition<i32>
+    let ms = monitor.size();        // PhysicalSize<u32>
+    let sf = monitor.scale_factor(); // f64
+
+    // Window logical size from conf (380x400). Convert to physical.
+    let win_w_phys = (380.0 * sf) as i32;
+    let win_h_phys = (400.0 * sf) as i32;
+    let margin_phys = (40.0 * sf) as i32;
+    let dock_phys = (110.0 * sf) as i32;
+
+    let new_x = mp.x + (ms.width as i32) - win_w_phys - margin_phys;
+    let new_y = mp.y + (ms.height as i32) - win_h_phys - dock_phys;
+
+    let clamp_x = new_x.max(mp.x);
+    let clamp_y = new_y.max(mp.y);
+
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true).append(true)
+        .open(dirs::home_dir().unwrap_or_default().join(".mavis/pet/logs/floater-hitregion.log")) {
+        use std::io::Write;
+        let _ = writeln!(
+            f,
+            "[STARTUP v2] monitor pos=({},{}) size={}x{} sf={} -> set_position physical=({},{}) (clamp={},{})",
+            mp.x, mp.y, ms.width, ms.height, sf, new_x, new_y, clamp_x, clamp_y
+        );
+    }
+
+    let _ = window.set_position(tauri::Position::Physical(
+        tauri::PhysicalPosition { x: clamp_x, y: clamp_y },
+    ));
+    // v0.7.6.7 — record the live position into shared state. The poller
+    // reads from here instead of NSPanel's stale [NSWindow frame].
+    frame_state.set(
+        clamp_x as f64, clamp_y as f64,
+        win_w_phys as f64, win_h_phys as f64,
+        sf,
+    );
+}
+
+/// Background task: every 8ms read the global cursor position, compare to
+/// the union of interactive rects (in window-local CSS pixels) reported by
+/// the WebView, and toggle ignoresMouseEvents on the panel accordingly.
+fn spawn_hit_region_poller(
+    window: tauri::WebviewWindow,
+    rects: InteractiveRects,
+    frame_state: WindowFrameState,
+) {
+    std::thread::spawn(move || {
+        // v0.7.6.2 debug — write polling state to a log file so we can
+        // diagnose without relying on stderr (launchd plist captures the
+        // CLI's stderr, not the floater child process's).
+        let log_path = dirs::home_dir()
+            .unwrap_or_default()
+            .join(".mavis/pet/logs/floater-hitregion.log");
+        let mut log_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .ok();
+        let mut tick: u64 = 0;
+        // Last known state, used to skip redundant invocations.
+        let mut last_ignore: Option<bool> = None;
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(8));
+            tick += 1;
+
+            // 1. Cursor position. mouse_position::Mouse on macOS calls
+            //    CGEvent::location() which returns CGPoint in LOGICAL
+            //    POINTS (top-left global), NOT physical pixels. We
+            //    therefore work in logical points throughout — convert
+            //    the window frame from physical to logical via sf.
+            let cursor = match mouse_position::mouse_position::Mouse::get_mouse_position() {
+                mouse_position::mouse_position::Mouse::Position { x, y } => (x as f64, y as f64),
+                _ => continue,
+            };
+
+            // 2. Live window frame from WindowFrameState (kept in sync
+            //    by startup positioning + WindowEvent::Moved). Don't use
+            //    read_panel_frame_top_left — its [NSWindow frame] call
+            //    goes stale under tauri-nspanel's swizzle, locking the
+            //    poller to the construction-time position.
+            let (wx_phys, wy_phys, ww_phys, wh_phys, sf) = match frame_state.snapshot() {
+                Some(v) => v,
+                None => continue,  // not positioned yet (first 500ms)
+            };
+            // Convert to logical points to match cursor units.
+            let wx = wx_phys / sf;
+            let wy = wy_phys / sf;
+            let ww = ww_phys / sf;
+            let wh = wh_phys / sf;
+
+            // 3. Quick reject: cursor outside the window's outer frame.
+            let inside_window = cursor.0 >= wx
+                && cursor.0 < wx + ww
+                && cursor.1 >= wy
+                && cursor.1 < wy + wh;
+
+            // 4. Inside the window: convert cursor to CSS pixels relative
+            //    to the WebView's top-left and check against the rect set.
+            //    CSS pixels == logical points on macOS, so this is just
+            //    a translate (no further scaling).
+            let snapshot = rects.snapshot();
+            let cursor_in_interactive = if inside_window {
+                let local_x = cursor.0 - wx;
+                let local_y = cursor.1 - wy;
+                snapshot.iter().any(|(rx, ry, rw, rh)| {
+                    local_x >= *rx
+                        && local_x < *rx + *rw
+                        && local_y >= *ry
+                        && local_y < *ry + *rh
+                })
+            } else {
+                false
+            };
+
+            let want_ignore = !cursor_in_interactive;
+            if last_ignore != Some(want_ignore) {
+                let _ = window.set_ignore_cursor_events(want_ignore);
+                last_ignore = Some(want_ignore);
+                if let Some(f) = log_file.as_mut() {
+                    use std::io::Write;
+                    let _ = writeln!(
+                        f,
+                        "[t={}] cursor=({:.0},{:.0}) win=({:.0},{:.0},{:.0},{:.0}) inside_win={} rects={} in_interactive={} -> ignore={}",
+                        tick, cursor.0, cursor.1, wx, wy, ww, wh,
+                        inside_window, snapshot.len(), cursor_in_interactive, want_ignore
+                    );
+                    let _ = f.flush();
+                }
+            }
+            // Heartbeat every ~5s.
+            if tick % 625 == 0 {
+                if let Some(f) = log_file.as_mut() {
+                    use std::io::Write;
+                    let first_rect = snapshot.first()
+                        .map(|(x, y, w, h)| format!("[{:.0},{:.0},{:.0},{:.0}]", x, y, w, h))
+                        .unwrap_or_else(|| "none".to_string());
+                    let _ = writeln!(
+                        f,
+                        "[t={} HB] cursor=({:.0},{:.0}) win=({:.0},{:.0},{:.0},{:.0}) sf={} rects={} first_rect={} ignore={:?}",
+                        tick, cursor.0, cursor.1, wx, wy, ww, wh, sf, snapshot.len(), first_rect, last_ignore
+                    );
+                    let _ = f.flush();
+                }
+            }
+        }
+    });
+}
+
+/// Read the live NSPanel frame (origin + size) directly via AppKit.
+/// Returns (x, y, w, h) in TOP-LEFT origin, PHYSICAL pixels — same
+/// convention as mouse_position::Mouse::Position on macOS.
+///
+/// Why not Tauri's `window.outer_position()` / `outer_size()`?
+/// tauri-nspanel swizzles the underlying NSWindow class but Tauri's
+/// runtime still serves outer_position() from a cache populated at
+/// construction time. After the user drags the panel, that cache is
+/// stale — outer_position() returns the panel's INITIAL position, not
+/// where the user dragged it to. set_ignore_cursor_events gating
+/// requires the LIVE position; only [NSWindow frame] gives that.
+#[cfg(target_os = "macos")]
+fn read_panel_frame_top_left(window: &tauri::WebviewWindow) -> Option<(f64, f64, f64, f64, f64)> {
+    use cocoa::appkit::{NSScreen, NSWindow};
+    use cocoa::base::{id, nil};
+    use cocoa::foundation::{NSArray, NSRect};
+    let ns_window: id = window.ns_window().ok()? as id;
+    if ns_window.is_null() { return None; }
+    unsafe {
+        // [NSWindow frame] — bottom-left origin, points (logical px).
+        let frame: NSRect = NSWindow::frame(ns_window);
+        // Backing scale factor of the window's screen.
+        let screen: id = ns_window.screen();
+        let sf: f64 = if screen != nil {
+            NSScreen::backingScaleFactor(screen) as f64
+        } else {
+            1.0
+        };
+        // Convert bottom-left → top-left. Use the primary screen height as
+        // reference (matches macOS top-left convention used by Tauri /
+        // mouse_position).
+        let screens: id = NSScreen::screens(nil);
+        if screens == nil || screens.count() == 0 { return None; }
+        let primary: id = screens.objectAtIndex(0);
+        let primary_frame: NSRect = NSScreen::frame(primary);
+        let primary_height = primary_frame.size.height as f64;
+
+        let x_logical = frame.origin.x as f64;
+        let y_bottom_logical = frame.origin.y as f64;
+        let w_logical = frame.size.width as f64;
+        let h_logical = frame.size.height as f64;
+        let y_top_logical = primary_height - (y_bottom_logical + h_logical);
+
+        let x = x_logical * sf;
+        let y = y_top_logical * sf;
+        let w = w_logical * sf;
+        let h = h_logical * sf;
+        Some((x, y, w, h, sf))
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn read_panel_frame_top_left(_window: &tauri::WebviewWindow) -> Option<(f64, f64, f64, f64, f64)> {
+    None
 }
 
 // keep compile unused-var lint quiet
